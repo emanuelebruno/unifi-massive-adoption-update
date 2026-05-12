@@ -2,6 +2,7 @@ import argparse
 import csv
 import ipaddress
 import json
+import logging
 import os
 import platform
 import re
@@ -19,6 +20,10 @@ EXPECTED_FIRMWARE_FAMILY = "BZ.qca933x"
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
 COMPATIBLE_DEVICE_MODELS = {"UAP-InWall"}
+
+# Sopprimi log rumorosi di paramiko
+logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
 
 @dataclass(frozen=True)
