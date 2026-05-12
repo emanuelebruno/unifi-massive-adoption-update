@@ -145,6 +145,63 @@ In quel caso eseguire una prima connessione manuale per salvare la host key:
 plink.exe -ssh -P 22 -l ubnt -pw ubnt 192.168.0.4 "cat /etc/version"
 ```
 
+## Esecuzione fase 2 (aggiornamento firmware)
+
+Lo script di Fase 2 è: `uap_iw_phase2_firmware_update.py`.
+
+Input:
+- report prodotto dalla Fase 1 (preferibilmente JSON)
+- firmware locale nella cartella `.\firmware\`
+
+### Dry-run (default)
+
+Senza `--execute` lo script non carica firmware, non avvia upgrade e non scrive nella cache PuTTY.
+
+```powershell
+python .\uap_iw_phase2_firmware_update.py `
+  --input .\reports\report_subnet.json `
+  --firmware .\firmware\BZ.qca933x.v4.3.28.11361.210128.2309.bin `
+  --target-version-full 4.3.28.11361 `
+  --target-version-short BZ.v4.3.28 `
+  --user ubnt --password ubnt `
+  --plink-path plink.exe --pscp-path pscp.exe `
+  --out .\reports\phase2_update_report.csv `
+  --json .\reports\phase2_update_report.json
+```
+
+### Execute (attenzione)
+
+Con `--execute` lo script può caricare il firmware e avviare l'upgrade, ma solo sugli AP identificati come UAP-IW / U2IW nel report della Fase 1 (`MODEL_FAMILY_OK`).
+
+```powershell
+python .\uap_iw_phase2_firmware_update.py `
+  --input .\reports\report_subnet.json `
+  --firmware .\firmware\BZ.qca933x.v4.3.28.11361.210128.2309.bin `
+  --target-version-full 4.3.28.11361 `
+  --target-version-short BZ.v4.3.28 `
+  --user ubnt --password ubnt `
+  --plink-path plink.exe --pscp-path pscp.exe `
+  --out .\reports\phase2_update_report.csv `
+  --json .\reports\phase2_update_report.json `
+  --workers 1 `
+  --execute
+```
+
+### Host key PuTTY e --accept-new-hostkeys
+
+Per impostazione predefinita lo script non accetta automaticamente nuove host key PuTTY.
+
+In scenari massivi (AP appena resettati) puoi abilitare l'accettazione automatica delle sole host key nuove/sconosciute con:
+
+```powershell
+--accept-new-hostkeys
+```
+
+Note:
+- Usare `--accept-new-hostkeys` solo in rete controllata.
+- Le host key mismatch/changed non vengono mai accettate automaticamente.
+- La cache PuTTY è per-utente Windows. Se lo script gira come SYSTEM (es. TacticalRMM) potrebbe non vedere le host key salvate dall'utente interattivo e potrebbe creare/gestire una cache separata.
+
 ## Note di sicurezza
 
 Non committare:
