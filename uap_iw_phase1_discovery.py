@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,9 @@ import paramiko
 
 
 EXPECTED_FIRMWARE_FAMILY = "BZ.qca933x"
+COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
+COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
+COMPATIBLE_DEVICE_MODELS = {"UAP-InWall"}
 
 
 @dataclass(frozen=True)
@@ -113,7 +117,7 @@ def parse_arp_table(arp_output: str) -> Dict[str, str]:
         re.IGNORECASE,
     )
     unix_line = re.compile(
-        r"$(?P<ip>\d{1,3}(?:\.\d{1,3}){3})$\s+at\s+"
+        r"\((?P<ip>\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+"
         r"(?P<mac>[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})",
         re.IGNORECASE,
     )
@@ -192,56 +196,218 @@ def extract_firmware_family(firmware_version: str) -> str:
     return m.group(1) if m else ""
 
 
-def parse_board_info(board_info: str) -> Tuple[Optional[str], Optional[str]]:
-    board_name = None
-    device_model = None
+def normalize_hwaddr(value: str) -> str:
+    s = (value or "").strip()
+    if not s:
+        return ""
+    s_clean = re.sub(r"[^0-9A-Fa-f]", "", s)
+    if len(s_clean) == 12 and re.fullmatch(r"[0-9A-Fa-f]{12}", s_clean):
+        try:
+            return normalize_mac(s_clean)
+        except ValueError:
+            return s
+    return s
+
+
+def parse_board_info_extended(board_info: str) -> Dict[str, str]:
+    board_name = ""
+    board_shortname = ""
+    board_hwaddr = ""
 
     for raw in (board_info or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if "=" in line:
-            k, v = line.split("=", 1)
-            k = k.strip().lower()
-            v = v.strip()
-            if k in ("board.name", "board_name", "boardname"):
-                board_name = v
-            if k in ("board.model", "board_model", "model"):
-                device_model = v
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k == "board.name":
+            board_name = v
+        elif k == "board.shortname":
+            board_shortname = v
+        elif k == "board.hwaddr":
+            board_hwaddr = normalize_hwaddr(v)
 
-    return device_model, board_name
+    return {
+        "board_name": board_name,
+        "board_shortname": board_shortname,
+        "board_hwaddr": board_hwaddr,
+    }
 
 
-def parse_mca_info(mca_info: str) -> Optional[str]:
+def parse_board_info(board_info: str) -> Tuple[Optional[str], Optional[str]]:
+    info = parse_board_info_extended(board_info)
+    board_name = info.get("board_name") or None
+    return None, board_name
+
+
+def parse_mca_info_extended(mca_info: str) -> Dict[str, str]:
     text = (mca_info or "").strip()
     if not text:
-        return None
+        return {"device_model": "", "firmware_version_full": ""}
+
+    model = ""
+    version = ""
 
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
-        m = re.search(r"\bmodel\b\s*[:=]\s*(.+)$", line, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
+        m = re.match(r"^Model\s*:\s*(.+)$", line, re.IGNORECASE)
+        if m and not model:
+            model = m.group(1).strip()
+            continue
+        m = re.match(r"^Version\s*:\s*(.+)$", line, re.IGNORECASE)
+        if m and not version:
+            version = m.group(1).strip()
+            continue
 
     m = re.search(r'"model"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    if m and not model:
+        model = m.group(1).strip()
 
-    return None
+    m = re.search(r'"version"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    if m and not version:
+        version = m.group(1).strip()
+
+    return {"device_model": model, "firmware_version_full": version}
 
 
-def ssh_collect_device_info(
-    host: str, user: str, password: str, timeout: int
-) -> Dict[str, object]:
+def parse_mca_info(mca_info: str) -> Optional[str]:
+    info = parse_mca_info_extended(mca_info)
+    model = info.get("device_model") or ""
+    return model or None
+
+
+def evaluate_model_family(board_name: str, board_shortname: str, device_model: str) -> str:
+    bn = (board_name or "").strip()
+    bs = (board_shortname or "").strip()
+    dm = (device_model or "").strip()
+
+    if bn or bs or dm:
+        if bs and bs in COMPATIBLE_BOARD_SHORTNAMES:
+            return "MODEL_FAMILY_OK"
+        if bn and bn in COMPATIBLE_BOARD_NAMES:
+            return "MODEL_FAMILY_OK"
+        if dm and dm in COMPATIBLE_DEVICE_MODELS:
+            return "MODEL_FAMILY_OK"
+
+        if bs and bs not in COMPATIBLE_BOARD_SHORTNAMES:
+            return "MODEL_FAMILY_MISMATCH"
+        if bn and bn not in COMPATIBLE_BOARD_NAMES:
+            return "MODEL_FAMILY_MISMATCH"
+        if dm and dm not in COMPATIBLE_DEVICE_MODELS:
+            return "MODEL_FAMILY_MISMATCH"
+
+        return "MODEL_FAMILY_UNKNOWN"
+
+    return "MODEL_FAMILY_UNKNOWN"
+
+
+def ssh_error_type_from_paramiko_exception(e: Exception) -> str:
+    msg = str(e or "").lower()
+    if "incompatible ssh peer" in msg or "no acceptable host key" in msg or "no matching host key type found" in msg:
+        return "SSH_LEGACY_HOSTKEY_UNSUPPORTED_BY_PARAMIKO"
+    if isinstance(e, paramiko.AuthenticationException):
+        return "SSH_AUTH_FAILED"
+    if "timed out" in msg or "timeout" in msg:
+        return "SSH_TIMEOUT"
+    return "SSH_ERROR"
+
+
+def clean_plink_output(text: str) -> str:
+    lines: List[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip("\r\n")
+        if not line:
+            continue
+        if line.strip() == "Access granted. Press Return to begin session.":
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def plink_error_type(stdout: str, stderr: str, returncode: Optional[int]) -> str:
+    combined = (stdout or "") + "\n" + (stderr or "")
+    s = combined.lower()
+    if "host key is not cached" in s or "server's host key is not cached" in s:
+        return "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
+    if "host key did not match" in s or "host key mismatch" in s:
+        return "SSH_HOSTKEY_MISMATCH"
+    if "access denied" in s or "authentication refused" in s:
+        return "SSH_AUTH_FAILED"
+    if "network error" in s and "timed out" in s:
+        return "SSH_TIMEOUT"
+    if "network error" in s or "connection refused" in s or "no route to host" in s:
+        return "SSH_UNREACHABLE"
+    if returncode not in (0, None):
+        return "SSH_ERROR"
+    return ""
+
+
+def plink_run_command(
+    plink_path: str,
+    host: str,
+    user: str,
+    password: str,
+    command: str,
+    timeout: int,
+    send_newline: bool,
+) -> Tuple[str, str, Optional[int], Optional[str]]:
+    resolved = shutil.which(plink_path) if plink_path else None
+    if not resolved:
+        return "", "", None, f"plink not found: {plink_path}"
+
+    cmd = [
+        resolved,
+        "-ssh",
+        "-P",
+        "22",
+        "-l",
+        user,
+        "-pw",
+        password,
+        "-batch",
+        host,
+        command,
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=("\n" if send_newline else None),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout),
+            check=False,
+            creationflags=(subprocess.CREATE_NO_WINDOW if platform.system().lower().startswith("win") else 0),
+        )
+        out = clean_plink_output(proc.stdout or "")
+        err = clean_plink_output(proc.stderr or "")
+        return out, err, proc.returncode, None
+    except subprocess.TimeoutExpired:
+        return "", "", None, "timeout"
+    except Exception as e:
+        return "", "", None, str(e)
+
+
+def paramiko_collect_device_info(host: str, user: str, password: str, timeout: int) -> Dict[str, object]:
     result: Dict[str, object] = {
         "ssh_ok": False,
+        "ssh_backend": "paramiko",
+        "ssh_error_type": "",
+        "firmware_version_short": "",
+        "firmware_version_full": "",
         "firmware_version": "",
         "firmware_family": "",
         "firmware_family_ok": False,
-        "device_model": "",
         "board_name": "",
+        "board_shortname": "",
+        "board_hwaddr": "",
+        "device_model": "",
+        "model_family_status": "MODEL_FAMILY_UNKNOWN",
         "error": "",
     }
 
@@ -263,47 +429,162 @@ def ssh_collect_device_info(
 
         v_out, v_err, v_code, v_exc = ssh_run_command(client, "cat /etc/version", timeout)
         if v_exc:
+            result["ssh_error_type"] = "SSH_COMMAND_FAILED"
             result["error"] = f"cat /etc/version: {v_exc}"
             return result
         if v_code not in (0, None) and not v_out:
+            result["ssh_error_type"] = "SSH_COMMAND_FAILED"
             result["error"] = f"cat /etc/version failed (exit={v_code}) {v_err}".strip()
             return result
 
-        firmware_version = (v_out.splitlines()[0].strip() if v_out else "")
-        result["firmware_version"] = firmware_version
-        fam = extract_firmware_family(firmware_version)
-        result["firmware_family"] = fam
-        result["firmware_family_ok"] = bool(firmware_version.startswith(EXPECTED_FIRMWARE_FAMILY))
+        firmware_short = (v_out.splitlines()[0].strip() if v_out else "")
+        result["firmware_version_short"] = firmware_short
+        result["firmware_version"] = firmware_short
+        result["firmware_family"] = extract_firmware_family(firmware_short)
 
         b_out, b_err, b_code, b_exc = ssh_run_command(client, "cat /etc/board.info", timeout)
         if not b_exc and (b_out or b_err):
-            model_from_board, board_name = parse_board_info(b_out)
-            if model_from_board and not result["device_model"]:
-                result["device_model"] = model_from_board
-            if board_name:
-                result["board_name"] = board_name
+            b = parse_board_info_extended(b_out)
+            result["board_name"] = b.get("board_name") or ""
+            result["board_shortname"] = b.get("board_shortname") or ""
+            result["board_hwaddr"] = b.get("board_hwaddr") or ""
 
         m_out, m_err, m_code, m_exc = ssh_run_command(client, "mca-cli-op info", timeout)
         if not m_exc and (m_out or m_err):
-            model = parse_mca_info(m_out)
-            if model:
-                result["device_model"] = model
+            m = parse_mca_info_extended(m_out)
+            if m.get("device_model"):
+                result["device_model"] = m.get("device_model") or ""
+            if m.get("firmware_version_full"):
+                result["firmware_version_full"] = m.get("firmware_version_full") or ""
 
-        return result
-    except paramiko.AuthenticationException:
-        result["error"] = "SSH auth failed"
-        return result
-    except (paramiko.SSHException, OSError, TimeoutError) as e:
-        result["error"] = f"SSH error: {e}"
+        result["model_family_status"] = evaluate_model_family(
+            result.get("board_name") or "",
+            result.get("board_shortname") or "",
+            result.get("device_model") or "",
+        )
+        result["firmware_family_ok"] = result["model_family_status"] == "MODEL_FAMILY_OK"
         return result
     except Exception as e:
-        result["error"] = f"SSH unexpected error: {e}"
+        result["ssh_ok"] = False
+        result["ssh_error_type"] = ssh_error_type_from_paramiko_exception(e)
+        result["error"] = str(e)
         return result
     finally:
         try:
             client.close()
         except Exception:
             pass
+
+
+def plink_collect_device_info(
+    host: str, user: str, password: str, timeout: int, plink_path: str
+) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "ssh_ok": False,
+        "ssh_backend": "plink",
+        "ssh_error_type": "",
+        "firmware_version_short": "",
+        "firmware_version_full": "",
+        "firmware_version": "",
+        "firmware_family": "",
+        "firmware_family_ok": False,
+        "board_name": "",
+        "board_shortname": "",
+        "board_hwaddr": "",
+        "device_model": "",
+        "model_family_status": "MODEL_FAMILY_UNKNOWN",
+        "error": "",
+    }
+
+    v_out, v_err, v_rc, v_exc = plink_run_command(
+        plink_path=plink_path,
+        host=host,
+        user=user,
+        password=password,
+        command="cat /etc/version",
+        timeout=timeout,
+        send_newline=True,
+    )
+    if v_exc:
+        if v_exc == "timeout":
+            result["ssh_error_type"] = "SSH_TIMEOUT"
+            result["error"] = "plink timeout"
+            return result
+        result["ssh_error_type"] = "SSH_PLINK_ERROR"
+        result["error"] = v_exc
+        return result
+    if v_rc != 0:
+        result["ssh_error_type"] = plink_error_type(v_out, v_err, v_rc) or "SSH_ERROR"
+        result["error"] = (v_err or v_out or "plink command failed").strip()
+        return result
+
+    result["ssh_ok"] = True
+    firmware_short = (v_out.splitlines()[0].strip() if v_out else "")
+    result["firmware_version_short"] = firmware_short
+    result["firmware_version"] = firmware_short
+    result["firmware_family"] = extract_firmware_family(firmware_short)
+
+    b_out, b_err, b_rc, b_exc = plink_run_command(
+        plink_path=plink_path,
+        host=host,
+        user=user,
+        password=password,
+        command="cat /etc/board.info",
+        timeout=timeout,
+        send_newline=True,
+    )
+    if not b_exc and b_rc == 0 and b_out:
+        b = parse_board_info_extended(b_out)
+        result["board_name"] = b.get("board_name") or ""
+        result["board_shortname"] = b.get("board_shortname") or ""
+        result["board_hwaddr"] = b.get("board_hwaddr") or ""
+
+    m_out, m_err, m_rc, m_exc = plink_run_command(
+        plink_path=plink_path,
+        host=host,
+        user=user,
+        password=password,
+        command="mca-cli-op info",
+        timeout=timeout,
+        send_newline=True,
+    )
+    if not m_exc and m_rc == 0 and m_out:
+        m = parse_mca_info_extended(m_out)
+        if m.get("device_model"):
+            result["device_model"] = m.get("device_model") or ""
+        if m.get("firmware_version_full"):
+            result["firmware_version_full"] = m.get("firmware_version_full") or ""
+
+    result["model_family_status"] = evaluate_model_family(
+        result.get("board_name") or "",
+        result.get("board_shortname") or "",
+        result.get("device_model") or "",
+    )
+    result["firmware_family_ok"] = result["model_family_status"] == "MODEL_FAMILY_OK"
+    return result
+
+
+def ssh_collect_device_info(
+    host: str,
+    user: str,
+    password: str,
+    timeout: int,
+    ssh_backend: str,
+    plink_path: str,
+) -> Dict[str, object]:
+    backend = (ssh_backend or "auto").strip().lower()
+    if backend not in {"auto", "paramiko", "plink"}:
+        backend = "auto"
+
+    if backend == "paramiko":
+        return paramiko_collect_device_info(host, user=user, password=password, timeout=timeout)
+    if backend == "plink":
+        return plink_collect_device_info(host, user=user, password=password, timeout=timeout, plink_path=plink_path)
+
+    res = paramiko_collect_device_info(host, user=user, password=password, timeout=timeout)
+    if not res.get("ssh_ok") and res.get("ssh_error_type") == "SSH_LEGACY_HOSTKEY_UNSUPPORTED_BY_PARAMIKO":
+        return plink_collect_device_info(host, user=user, password=password, timeout=timeout, plink_path=plink_path)
+    return res
 
 
 def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
@@ -315,11 +596,18 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "ip_found",
         "ping_ok",
         "ssh_ok",
+        "ssh_backend",
+        "ssh_error_type",
+        "firmware_version_short",
+        "firmware_version_full",
         "firmware_version",
         "firmware_family",
         "firmware_family_ok",
-        "device_model",
         "board_name",
+        "board_shortname",
+        "board_hwaddr",
+        "device_model",
+        "model_family_status",
         "status",
         "error",
     ]
@@ -347,11 +635,18 @@ def build_initial_rows(aps: List[APExpected]) -> List[Dict[str, object]]:
                 "ip_found": False,
                 "ping_ok": False,
                 "ssh_ok": False,
+                "ssh_backend": "",
+                "ssh_error_type": "",
+                "firmware_version_short": "",
+                "firmware_version_full": "",
                 "firmware_version": "",
                 "firmware_family": "",
                 "firmware_family_ok": False,
                 "device_model": "",
                 "board_name": "",
+                "board_shortname": "",
+                "board_hwaddr": "",
+                "model_family_status": "MODEL_FAMILY_UNKNOWN",
                 "status": "IP_NOT_FOUND",
                 "error": "",
             }
@@ -364,6 +659,8 @@ def process_one_ap(
     user: str,
     password: str,
     timeout: int,
+    ssh_backend: str,
+    plink_path: str,
 ) -> Dict[str, object]:
     row = dict(base_row)
     ip = (row.get("ip") or "").strip()
@@ -382,13 +679,22 @@ def process_one_ap(
 
     row["ping_ok"] = True
 
-    info = ssh_collect_device_info(ip, user=user, password=password, timeout=timeout)
+    info = ssh_collect_device_info(
+        ip, user=user, password=password, timeout=timeout, ssh_backend=ssh_backend, plink_path=plink_path
+    )
     row["ssh_ok"] = bool(info.get("ssh_ok"))
+    row["ssh_backend"] = info.get("ssh_backend") or ""
+    row["ssh_error_type"] = info.get("ssh_error_type") or ""
+    row["firmware_version_short"] = info.get("firmware_version_short") or ""
+    row["firmware_version_full"] = info.get("firmware_version_full") or ""
     row["firmware_version"] = info.get("firmware_version") or ""
     row["firmware_family"] = info.get("firmware_family") or ""
     row["firmware_family_ok"] = bool(info.get("firmware_family_ok"))
     row["device_model"] = info.get("device_model") or ""
     row["board_name"] = info.get("board_name") or ""
+    row["board_shortname"] = info.get("board_shortname") or ""
+    row["board_hwaddr"] = info.get("board_hwaddr") or ""
+    row["model_family_status"] = info.get("model_family_status") or "MODEL_FAMILY_UNKNOWN"
 
     err = info.get("error") or ""
     if err:
@@ -398,14 +704,18 @@ def process_one_ap(
         row["status"] = "IP_FOUND_SSH_FAILED"
         return row
 
-    if not row["firmware_version"]:
+    if not (row.get("firmware_version_short") or "").strip():
         row["status"] = "FIRMWARE_READ_FAILED"
         if not row["error"]:
             row["error"] = "Firmware version empty"
         return row
 
-    if not row["firmware_family_ok"]:
+    if row.get("model_family_status") == "MODEL_FAMILY_MISMATCH":
         row["status"] = "MODEL_FAMILY_MISMATCH"
+        return row
+
+    if row.get("model_family_status") == "MODEL_FAMILY_UNKNOWN":
+        row["status"] = "MODEL_FAMILY_UNKNOWN"
         return row
 
     row["status"] = "IP_FOUND_SSH_OK"
@@ -417,8 +727,9 @@ def print_ap_line(row: Dict[str, object]) -> None:
     ubic = row.get("ubicazione") or ""
     ip = row.get("ip") or ""
     status = row.get("status") or ""
-    fw = row.get("firmware_version") or ""
+    fw = row.get("firmware_version_short") or row.get("firmware_version") or ""
     ssh_ok = row.get("ssh_ok")
+    ssh_backend = row.get("ssh_backend") or ""
     ip_found = row.get("ip_found")
     ping_ok = row.get("ping_ok")
 
@@ -428,7 +739,7 @@ def print_ap_line(row: Dict[str, object]) -> None:
 
     parts = [f"[AP] {mac} - {ubic} - IP {ip}"]
     parts.append("PING OK" if ping_ok else "PING FAIL")
-    parts.append("SSH OK" if ssh_ok else "SSH FAIL")
+    parts.append(("SSH OK" if ssh_ok else "SSH FAIL") + (f" ({ssh_backend})" if ssh_backend else ""))
     if fw:
         parts.append(f"Firmware {fw}")
     parts.append(str(status))
@@ -440,9 +751,9 @@ def summarize(rows: List[Dict[str, object]]) -> Dict[str, int]:
     ip_found = sum(1 for r in rows if r.get("ip_found"))
     ping_ok = sum(1 for r in rows if r.get("ping_ok"))
     ssh_ok = sum(1 for r in rows if r.get("ssh_ok"))
-    fw_read = sum(1 for r in rows if bool((r.get("firmware_version") or "").strip()))
-    fam_ok = sum(1 for r in rows if r.get("firmware_family_ok"))
-    mismatch = sum(1 for r in rows if (r.get("status") == "MODEL_FAMILY_MISMATCH"))
+    fw_read = sum(1 for r in rows if bool((r.get("firmware_version_short") or "").strip()))
+    fam_ok = sum(1 for r in rows if (r.get("model_family_status") == "MODEL_FAMILY_OK"))
+    mismatch = sum(1 for r in rows if (r.get("model_family_status") == "MODEL_FAMILY_MISMATCH"))
     errors = sum(1 for r in rows if bool((r.get("error") or "").strip()))
     return {
         "total": total,
@@ -463,6 +774,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--single-ip", dest="single_ip", help="Test singolo IP (bypass ARP discovery)")
     p.add_argument("--user", default="ubnt", help="SSH username (default ubnt)")
     p.add_argument("--password", default="ubnt", help="SSH password (default ubnt)")
+    p.add_argument("--ssh-backend", dest="ssh_backend", default="auto", choices=["auto", "paramiko", "plink"])
+    p.add_argument("--plink-path", dest="plink_path", default="plink.exe", help="Path plink.exe (default: plink.exe)")
     p.add_argument("--out", required=True, help="CSV report output")
     p.add_argument("--json", dest="json_out", help="JSON report output (opzionale)")
     p.add_argument("--timeout", type=int, default=5, help="Timeout SSH (secondi)")
@@ -485,11 +798,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "ip_found": True,
                     "ping_ok": False,
                     "ssh_ok": False,
+                    "ssh_backend": "",
+                    "ssh_error_type": "",
+                    "firmware_version_short": "",
+                    "firmware_version_full": "",
                     "firmware_version": "",
                     "firmware_family": "",
                     "firmware_family_ok": False,
                     "device_model": "",
                     "board_name": "",
+                    "board_shortname": "",
+                    "board_hwaddr": "",
+                    "model_family_status": "MODEL_FAMILY_UNKNOWN",
                     "status": "",
                     "error": "",
                 }
@@ -525,7 +845,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[AP] Elaborazione AP (workers={max(1, args.workers)})...")
     processed: List[Dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        futs = [ex.submit(process_one_ap, r, args.user, args.password, args.timeout) for r in rows]
+        futs = [
+            ex.submit(process_one_ap, r, args.user, args.password, args.timeout, args.ssh_backend, args.plink_path)
+            for r in rows
+        ]
         for fut in as_completed(futs):
             try:
                 processed.append(fut.result())
@@ -538,11 +861,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "ip_found": False,
                         "ping_ok": False,
                         "ssh_ok": False,
+                        "ssh_backend": "",
+                        "ssh_error_type": "",
+                        "firmware_version_short": "",
+                        "firmware_version_full": "",
                         "firmware_version": "",
                         "firmware_family": "",
                         "firmware_family_ok": False,
                         "device_model": "",
                         "board_name": "",
+                        "board_shortname": "",
+                        "board_hwaddr": "",
+                        "model_family_status": "MODEL_FAMILY_UNKNOWN",
                         "status": "ERROR",
                         "error": f"Unhandled exception: {e}",
                     }

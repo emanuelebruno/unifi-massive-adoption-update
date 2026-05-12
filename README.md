@@ -110,10 +110,39 @@ python .\uap_iw_phase1_discovery.py --input .\aps.csv --subnet 192.168.1.0/24 --
 --single-ip 192.168.1.50
 --user ubnt
 --password ubnt
+--ssh-backend auto|paramiko|plink
+--plink-path plink.exe
 --out .\reports\report.csv
 --json .\reports\report.json
 --timeout 5
 --workers 64
+```
+
+### SSH backend (Paramiko / plink.exe)
+
+Di default lo script usa `--ssh-backend auto`:
+
+- prova prima Paramiko;
+- se Paramiko fallisce su AP con SSH legacy (es. `Incompatible ssh peer` / `no acceptable host key`), fa fallback automatico a `plink.exe`.
+
+Se vuoi forzare:
+
+```powershell
+python .\uap_iw_phase1_discovery.py --input .\aps.csv --single-ip 192.168.0.4 --ssh-backend plink --plink-path plink.exe --out .\reports\report.csv --json .\reports\report.json
+```
+
+#### Host key PuTTY
+
+Lo script non accetta automaticamente host key sconosciute tramite plink. Se la host key non è già salvata nella cache di PuTTY, nel report comparirà l'errore:
+
+```text
+SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT
+```
+
+In quel caso eseguire una prima connessione manuale per salvare la host key:
+
+```powershell
+plink.exe -ssh -P 22 -l ubnt -pw ubnt 192.168.0.4 "cat /etc/version"
 ```
 
 ## Note di sicurezza

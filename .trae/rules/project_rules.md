@@ -44,18 +44,22 @@ is intended only for Ubiquiti UniFi UAP-IW / U2IW access points.
 
 This firmware must never be uploaded or installed on any other UniFi model.
 
-Before any future firmware upgrade operation, the script must verify that the detected firmware/platform family is compatible with:
+Before any future firmware upgrade operation, the script must verify that the device is a UAP-IW / U2IW using read-only identification data (not `/etc/version`).
 
-`BZ.qca933x`
+Primary sources:
+- `cat /etc/board.info` (e.g. `board.shortname=U2IW`, `board.name=UAP-InWall`)
+- `mca-cli-op info` (e.g. `Model: UAP-InWall`)
 
-If the detected firmware version does not start with `BZ.qca933x`, the script must mark the device as:
+If the device cannot be identified as UAP-IW / U2IW, the script must mark the device as:
 
 `MODEL_FAMILY_MISMATCH`
 
 and must not upload or install the firmware.
 
-For Phase 1, this check is only informational and must be reported in the CSV/JSON output.
-For Phase 2, this check will be mandatory and must block the upgrade.
+Notes:
+- `/etc/version` may return values like `BZ.v4.3.28` and must not be used as the sole check for model/platform family.
+- For Phase 1, this model-family check is only informational and must be reported in the CSV/JSON output.
+- For Phase 2, this check will be mandatory and must block the upgrade.
 
 ## Safety rules
 
