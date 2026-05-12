@@ -86,9 +86,9 @@ Poi inserire i MAC reali e le ubicazioni.
 
 Il file `aps.csv` è ignorato da Git per evitare di pubblicare dati reali.
 
-## Esecuzione prevista fase 1
+## Esecuzione fase 1
 
-Quando lo script sarà generato:
+Lo script di Fase 1 è: `uap_iw_phase1_discovery.py`.
 
 ### Test singolo IP
 
@@ -100,6 +100,20 @@ python .\uap_iw_phase1_discovery.py --input .\aps.csv --single-ip 192.168.1.50 -
 
 ```powershell
 python .\uap_iw_phase1_discovery.py --input .\aps.csv --subnet 192.168.1.0/24 --user ubnt --password ubnt --out .\reports\report.csv --json .\reports\report.json
+```
+
+### Parametri
+
+```text
+--input aps.csv
+--subnet 192.168.1.0/24
+--single-ip 192.168.1.50
+--user ubnt
+--password ubnt
+--out .\reports\report.csv
+--json .\reports\report.json
+--timeout 5
+--workers 64
 ```
 
 ## Note di sicurezza
