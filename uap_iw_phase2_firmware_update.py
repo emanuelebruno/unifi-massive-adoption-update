@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
@@ -207,8 +208,10 @@ def run_pscp_upload(
     if hostkey_fingerprint:
         cmd.extend(["-hostkey", hostkey_fingerprint])
     cmd.extend(
+        [
         local_file,
         f"{user}@{host}:{remote_path}",
+        ]
     )
 
     try:
@@ -929,6 +932,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p = argparse.ArgumentParser(description="UAP-IW / U2IW Phase 2 firmware update (safe gated).")
     p.add_argument("--version", action="store_true", help="Stampa versione script ed esce")
+    p.add_argument("--verbose", action="store_true", help="Stampa dettagli aggiuntivi (incl. traceback su errori non gestiti)")
     p.add_argument("--input", required=True, help="Report Fase 1 (.json preferito, oppure .csv)")
     p.add_argument("--firmware", required=True, help="Firmware file path (.bin)")
     p.add_argument("--target-version-full", required=True)
@@ -978,8 +982,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     processed: List[Dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        futs = [
-            ex.submit(
+        fut_to_rec = {}
+        for rec in records:
+            fut = ex.submit(
                 process_one_ap,
                 rec,
                 firmware_path,
@@ -994,42 +999,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.accept_new_hostkeys,
                 args.execute,
             )
-            for rec in records
-        ]
-        for fut in as_completed(futs):
+            fut_to_rec[fut] = rec
+
+        for fut in as_completed(list(fut_to_rec.keys())):
             try:
                 processed.append(fut.result())
             except Exception as e:
-                processed.append(
-                    {
-                        "script_name": SCRIPT_NAME,
-                        "script_version": SCRIPT_VERSION,
-                        "script_build_date": SCRIPT_BUILD_DATE,
-                        "mac": "",
-                        "ubicazione": "",
-                        "ip": "",
-                        "pre_firmware_version_short": "",
-                        "pre_firmware_version_full": "",
-                        "post_firmware_version_short": "",
-                        "post_firmware_version_full": "",
-                        "board_name": "",
-                        "board_shortname": "",
-                        "device_model": "",
-                        "model_family_status": "",
-                        "hostkey_status": "HOSTKEY_NOT_CHECKED",
-                        "hostkey_auto_accepted": False,
-                        "hostkey_error_type": "",
-                        "hostkey_fingerprint": "",
-                        "action": "",
-                        "upload_ok": False,
-                        "upgrade_started": False,
-                        "reboot_detected": False,
-                        "device_back_online": False,
-                        "post_check_ok": False,
-                        "status": "ERROR",
-                        "error": f"Unhandled exception: {e}",
-                    }
-                )
+                rec = fut_to_rec.get(fut) or {}
+                row = init_phase2_row(rec)
+                if "action" in rec and (rec.get("action") or "").strip():
+                    row["action"] = (rec.get("action") or "").strip()
+                row["status"] = "ERROR"
+                row["error"] = f"Unhandled exception: {type(e).__name__}: {e}"
+                processed.append(row)
+
+                mac = (row.get("mac") or "").strip()
+                ip = (row.get("ip") or "").strip()
+                print(f"[PHASE2][ERROR] Unhandled exception for mac={mac} ip={ip}: {type(e).__name__}: {e}", file=sys.stderr)
+                if args.verbose:
+                    print(traceback.format_exc().strip(), file=sys.stderr)
 
     processed.sort(key=lambda r: (r.get("mac") or "", r.get("ip") or ""))
 
