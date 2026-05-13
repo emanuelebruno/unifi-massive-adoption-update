@@ -570,10 +570,10 @@ def plink_collect_device_info(
                 host=host,
                 user=user,
                 password=password,
-                command="echo ENROLL_OK",
+                command="cat /etc/version",
                 timeout=timeout,
                 batch=False,
-                stdin_data="y\n\n",
+                stdin_data="y\n",
             )
             if enroll_exc:
                 if enroll_exc == "timeout":
