@@ -165,6 +165,103 @@ function Find-UserPythonExe {
     return ($scored | Sort-Object -Property Score -Descending | Select-Object -First 1).Path
 }
 
+function Expand-ZipToDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)][string]$DestinationDir
+    )
+
+    if (-not (Test-Path -LiteralPath $ZipPath)) { throw "ZIP non trovato: $ZipPath" }
+    if (Test-Path -LiteralPath $DestinationDir) {
+        Remove-Item -LiteralPath $DestinationDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Ensure-Directory -Path $DestinationDir
+
+    if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestinationDir -Force
+        return
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestinationDir)
+}
+
+function Enable-ImportSiteForEmbeddedPython {
+    param([Parameter(Mandatory = $true)][string]$EmbedDir)
+
+    $pth = Get-ChildItem -LiteralPath $EmbedDir -Filter 'python*._pth' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pth) { throw "File ._pth non trovato in: $EmbedDir" }
+
+    $lines = Get-Content -LiteralPath $pth.FullName -ErrorAction Stop
+    $hasImportSite = $false
+    $newLines = foreach ($line in $lines) {
+        if ($line -match '^\s*#\s*import\s+site\s*$') {
+            $hasImportSite = $true
+            'import site'
+        } elseif ($line -match '^\s*import\s+site\s*$') {
+            $hasImportSite = $true
+            $line
+        } else {
+            $line
+        }
+    }
+
+    if (-not $hasImportSite) {
+        $newLines = @($newLines + 'import site')
+    }
+
+    Set-Content -LiteralPath $pth.FullName -Value $newLines -Encoding ASCII -Force
+}
+
+function Ensure-PythonEmbedded {
+    Ensure-Directory -Path $downloadsDir
+    Ensure-Directory -Path '.\tools'
+
+    $embedDir = '.\tools\python-embed'
+    $embedZipPath = Join-Path $downloadsDir 'python-embed.zip'
+
+    $pythonVersionsToTry = @('3.12.9', '3.12.8', '3.12.7', '3.12.6')
+    $downloaded = $false
+    foreach ($v in $pythonVersionsToTry) {
+        $url = "https://www.python.org/ftp/python/$v/python-$v-embed-amd64.zip"
+        try {
+            $downloaded = Download-Url -Url $url -DestinationPath $embedZipPath
+            if ($downloaded) { break }
+        } catch {
+        }
+    }
+
+    if (-not $downloaded) {
+        throw 'Impossibile scaricare Python embeddable zip da python.org.'
+    }
+
+    Expand-ZipToDirectory -ZipPath $embedZipPath -DestinationDir $embedDir
+    Enable-ImportSiteForEmbeddedPython -EmbedDir $embedDir
+
+    $embedPython = Join-Path $embedDir 'python.exe'
+    if (-not (Test-Path -LiteralPath $embedPython)) {
+        throw "python.exe non trovato in: $embedDir"
+    }
+
+    $getPipPath = Join-Path $downloadsDir 'get-pip.py'
+    $ok = Download-Url -Url 'https://bootstrap.pypa.io/get-pip.py' -DestinationPath $getPipPath
+    if (-not $ok) { throw 'Impossibile scaricare get-pip.py.' }
+
+    & $embedPython $getPipPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "get-pip.py fallito (exit code: $LASTEXITCODE)."
+    }
+
+    & $embedPython -m pip --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip non disponibile nel Python embeddable (exit code: $LASTEXITCODE)."
+    }
+
+    $script:UsingPythonEmbed = $true
+    $script:PythonEmbedExe = $embedPython
+    return $embedPython
+}
+
 function Ensure-Python {
     $pythonCmd = Resolve-PythonCommand
     if ($pythonCmd) { return $pythonCmd }
@@ -190,13 +287,15 @@ function Ensure-Python {
     }
 
     if (-not $downloaded) {
-        throw 'Impossibile scaricare l’installer Python da python.org.'
+        Write-Host 'WARNING: impossibile scaricare l’installer Python da python.org. Provo fallback Python embeddable.'
+        return Ensure-PythonEmbedded
     }
 
     Write-Host ("Esecuzione installer: {0}" -f $installerPath)
     $p = Start-Process -FilePath $installerPath -ArgumentList '/quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1' -Wait -PassThru
     if (($p.ExitCode -ne 0) -and ($p.ExitCode -ne 3010)) {
-        throw "Installazione Python fallita (exit code: $($p.ExitCode))."
+        Write-Host ("WARNING: installer Python fallito (exit code: {0}). Provo fallback Python embeddable." -f $p.ExitCode)
+        return Ensure-PythonEmbedded
     }
 
     $pythonExe = Find-UserPythonExe
@@ -209,7 +308,9 @@ function Ensure-Python {
 
     $pythonCmd = Resolve-PythonCommand
     if ($pythonCmd) { return $pythonCmd }
-    throw 'Python installato ma non rilevabile (PATH non aggiornato e python.exe non trovato in LocalAppData).'
+
+    Write-Host 'WARNING: Python installato ma non rilevabile. Provo fallback Python embeddable.'
+    return Ensure-PythonEmbedded
 }
 
 function Resolve-PuttyPaths {
@@ -373,27 +474,39 @@ Write-Host ('pscp:  ' + $script:PscpPath)
 
 Write-Section 'Virtualenv (.venv)'
 $venvPython = '.\.venv\Scripts\python.exe'
+$useVenv = $true
 if (Test-Path -LiteralPath $venvPython) {
     Write-Host 'OK: .venv già presente'
 } else {
     if (Test-Path -LiteralPath '.\.venv') {
         throw 'La cartella .venv esiste ma .venv\Scripts\python.exe non è presente. Elimina .venv e riesegui.'
     }
-    & $pythonLauncher -m venv .venv
-    if (-not (Test-Path -LiteralPath $venvPython)) {
-        throw 'Creazione venv fallita: .venv\Scripts\python.exe non trovato.'
+    try {
+        & $pythonLauncher -m venv .venv
+        if (-not (Test-Path -LiteralPath $venvPython)) {
+            throw 'Creazione venv fallita: .venv\Scripts\python.exe non trovato.'
+        }
+    } catch {
+        if ($script:UsingPythonEmbed) {
+            $useVenv = $false
+            Write-Host 'WARNING: venv non creabile con Python embeddable. Proseguo senza venv.'
+        } else {
+            throw
+        }
     }
 }
 
 Write-Section 'Install requirements'
-& $venvPython -m pip install -r .\requirements.txt
+$pythonForInstall = $venvPython
+if (-not $useVenv) { $pythonForInstall = $pythonLauncher }
+& $pythonForInstall -m pip install -r .\requirements.txt
 if ($LASTEXITCODE -ne 0) {
     throw "pip install fallito (exit code: $LASTEXITCODE)."
 }
 
 Write-Section 'py_compile'
-& $venvPython -m py_compile .\uap_iw_phase1_discovery.py
-& $venvPython -m py_compile .\uap_iw_phase2_firmware_update.py
+& $pythonForInstall -m py_compile .\uap_iw_phase1_discovery.py
+& $pythonForInstall -m py_compile .\uap_iw_phase2_firmware_update.py
 
 Write-Section 'Verifica finale firmware'
 if (-not (Test-Path -LiteralPath $firmwareLocal)) {
@@ -404,10 +517,14 @@ Write-Host "OK: $firmwareLocal"
 Write-Section 'Comandi pronti (NON eseguiti automaticamente)'
 $plinkForPrint = Quote-Arg $script:PlinkPath
 $pscpForPrint = Quote-Arg $script:PscpPath
+$pythonForPrint = '.\.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $pythonForPrint)) {
+    $pythonForPrint = '.\tools\python-embed\python.exe'
+}
 
 @"
 Fase 1:
-.\.venv\Scripts\python.exe .\uap_iw_phase1_discovery.py `
+$pythonForPrint .\uap_iw_phase1_discovery.py `
   --input .\aps.csv `
   --subnet 172.17.0.0/24 `
   --user ubnt `
@@ -419,7 +536,7 @@ Fase 1:
   --json .\reports\report_subnet.json
 
 Fase 2 dry-run:
-.\.venv\Scripts\python.exe .\uap_iw_phase2_firmware_update.py `
+$pythonForPrint .\uap_iw_phase2_firmware_update.py `
   --input .\reports\report_subnet.json `
   --firmware .\firmware\BZ.qca933x.v4.3.28.11361.210128.2309.bin `
   --target-version-full 4.3.28.11361 `

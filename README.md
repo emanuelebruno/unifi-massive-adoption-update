@@ -85,6 +85,7 @@ Caratteristiche:
 - `winget` è opzionale: se presente viene usato come primo tentativo.
 - Se `winget` manca o fallisce:
   - Python viene installato scaricando l’installer ufficiale da `python.org` in `.\downloads\python-installer.exe` (installazione silenziosa per utente corrente, senza admin).
+  - Se l’installer Python fallisce, viene usato un fallback **portable** con Python **embeddable** estratto in `.\tools\python-embed\` (nessuna installazione di sistema necessaria).
   - PuTTY viene installato scaricando l’MSI ufficiale in `.\downloads\putty-installer.msi` (se l’MSI fallisce, fallback su `plink.exe`/`pscp.exe` standalone in `.\tools\putty\`).
 - Non richiede Git.
 - `aps.csv` non deve stare nel repository: trasferiscilo separatamente sul PC remoto.
