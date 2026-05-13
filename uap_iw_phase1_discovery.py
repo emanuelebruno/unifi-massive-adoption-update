@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 SCRIPT_NAME = "uap_iw_phase1_discovery.py"
-SCRIPT_VERSION = "0.4.0"
+SCRIPT_VERSION = "0.4.1"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 1 discovery with plink -hostkey fingerprint handling"
+SCRIPT_SUMMARY = "Phase 1 discovery with robust Windows ARP/neighbor discovery and plink -hostkey fingerprint handling"
 
 if __name__ == "__main__" and "--version" in sys.argv[1:]:
     print(f"Script: {SCRIPT_NAME}")
@@ -125,18 +125,12 @@ def ping_sweep(subnet: ipaddress.IPv4Network, workers: int) -> int:
     return ok_count
 
 
-def parse_arp_table(arp_output: str) -> Dict[str, str]:
+def parse_arp_table(arp_output: str) -> Tuple[Dict[str, str], List[str]]:
     mac_to_ip: Dict[str, str] = {}
+    matched_lines: List[str] = []
 
-    win_line = re.compile(
-        r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+"
-        r"(?P<mac>[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})\s+"
-        r"(?P<type>\w+)",
-        re.IGNORECASE,
-    )
-    unix_line = re.compile(
-        r"\((?P<ip>\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+"
-        r"(?P<mac>[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})",
+    line_re = re.compile(
+        r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+(?P<mac>[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})",
         re.IGNORECASE,
     )
 
@@ -144,10 +138,7 @@ def parse_arp_table(arp_output: str) -> Dict[str, str]:
         line = line.strip()
         if not line:
             continue
-
-        m = win_line.search(line)
-        if not m:
-            m = unix_line.search(line)
+        m = line_re.search(line)
         if not m:
             continue
 
@@ -159,26 +150,114 @@ def parse_arp_table(arp_output: str) -> Dict[str, str]:
             continue
 
         mac_to_ip[mac] = ip
+        matched_lines.append(line)
 
-    return mac_to_ip
+    return mac_to_ip, matched_lines
 
 
-def read_arp_table() -> Tuple[Dict[str, str], Optional[str]]:
+def decode_with_fallback(data: bytes) -> str:
+    if not data:
+        return ""
+    for enc in ("mbcs", "cp1252", "utf-8", "latin-1"):
+        try:
+            return data.decode(enc, errors="replace")
+        except Exception:
+            continue
+    try:
+        return data.decode(errors="replace")
+    except Exception:
+        return str(data)
+
+
+def read_windows_neighbor_table() -> Tuple[Dict[str, str], Optional[str], str]:
+    ps_cmd = (
+        "Get-NetNeighbor -AddressFamily IPv4 "
+        "| Where-Object { $_.LinkLayerAddress -match '^[0-9A-Fa-f]{2}(-[0-9A-Fa-f]{2}){5}$' } "
+        "| Select-Object IPAddress,LinkLayerAddress "
+        "| ConvertTo-Json -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True,
+            check=False,
+            creationflags=(subprocess.CREATE_NO_WINDOW if platform.system().lower().startswith("win") else 0),
+        )
+        out = decode_with_fallback(proc.stdout or b"").strip()
+        err = decode_with_fallback(proc.stderr or b"").strip()
+        if proc.returncode != 0:
+            return {}, (err or out or f"Get-NetNeighbor failed rc={proc.returncode}").strip(), out
+        if not out:
+            return {}, None, out
+
+        data = json.loads(out)
+        items = data if isinstance(data, list) else [data]
+        mapping: Dict[str, str] = {}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ip = str(it.get("IPAddress") or "").strip()
+            ll = str(it.get("LinkLayerAddress") or "").strip()
+            if not ip or not ll:
+                continue
+            try:
+                mac = normalize_mac(ll)
+            except ValueError:
+                continue
+            mapping[mac] = ip
+        return mapping, None, out
+    except Exception as e:
+        return {}, str(e), ""
+
+
+def read_arp_table() -> Tuple[Dict[str, str], Optional[str], Dict[str, object]]:
     system = platform.system().lower()
     cmd = ["arp", "-a"]
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=(subprocess.CREATE_NO_WINDOW if system.startswith("win") else 0),
-        )
-        out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-        mapping = parse_arp_table(out)
-        return mapping, None
+        if system.startswith("win"):
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                check=False,
+                creationflags=(subprocess.CREATE_NO_WINDOW if system.startswith("win") else 0),
+            )
+            out_text = (decode_with_fallback(proc.stdout or b"") + "\n" + decode_with_fallback(proc.stderr or b"")).strip()
+        else:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=(subprocess.CREATE_NO_WINDOW if system.startswith("win") else 0),
+            )
+            out_text = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
+
+        arp_map, arp_lines = parse_arp_table(out_text)
+        diag: Dict[str, object] = {
+            "arp_raw": out_text,
+            "arp_parsed_lines": len(arp_lines),
+            "arp_matched_lines": arp_lines,
+            "neighbor_raw_json": "",
+            "neighbor_rows": 0,
+            "neighbor_error": "",
+        }
+
+        mapping = dict(arp_map)
+
+        if system.startswith("win"):
+            neigh_map, neigh_err, neigh_raw = read_windows_neighbor_table()
+            diag["neighbor_raw_json"] = neigh_raw
+            diag["neighbor_rows"] = len(neigh_map)
+            diag["neighbor_error"] = neigh_err or ""
+            if neigh_map:
+                mapping.update(neigh_map)
+            if neigh_err and not mapping:
+                return mapping, neigh_err, diag
+            return mapping, None, diag
+
+        return mapping, None, diag
     except Exception as e:
-        return {}, str(e)
+        return {}, str(e), {}
 
 
 def ssh_run_command(
@@ -1041,6 +1120,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--input", required=True, help="CSV input (mac, ubicazione)")
     p.add_argument("--subnet", help="Subnet CIDR (es. 192.168.1.0/24)")
     p.add_argument("--single-ip", dest="single_ip", help="Test singolo IP (bypass ARP discovery)")
+    p.add_argument("--arp-only", dest="arp_only", action="store_true", help="Modalità ARP-only: niente ping sweep subnet")
+    p.add_argument("--verbose-arp", dest="verbose_arp", action="store_true", help="Stampa diagnostica ARP/neighbor")
     p.add_argument("--user", default="ubnt", help="SSH username (default ubnt)")
     p.add_argument("--password", default="ubnt", help="SSH password (default ubnt)")
     p.add_argument("--ssh-backend", dest="ssh_backend", default="auto", choices=["auto", "paramiko", "plink"])
@@ -1108,9 +1189,58 @@ def main(argv: Optional[List[str]] = None) -> int:
                 }
             ]
         print(f"[SCAN] Test singolo IP {ip} (bypass subnet/ARP)")
+    elif args.arp_only:
+        print("[SCAN] Modalità ARP-only: nessun ping sweep")
+
+        arp_map, arp_err, arp_diag = read_arp_table()
+        if arp_err:
+            print(f"[ARP] Errore lettura tabella ARP/neighbor: {arp_err}")
+        print(f"[ARP] Trovati {len(arp_map)} dispositivi nella tabella ARP/neighbor")
+
+        if args.verbose_arp:
+            print("")
+            print(f"[ARP][VERBOSE] ARP righe parse: {int(arp_diag.get('arp_parsed_lines') or 0)}")
+            neighbor_rows = int(arp_diag.get("neighbor_rows") or 0)
+            print(f"[ARP][VERBOSE] Neighbor entries: {neighbor_rows}")
+            neighbor_err = (arp_diag.get("neighbor_error") or "").strip()
+            if neighbor_err:
+                print(f"[ARP][VERBOSE] Neighbor error: {neighbor_err}")
+
+            lines = arp_diag.get("arp_matched_lines") or []
+            if lines:
+                print("[ARP][VERBOSE] arp -a matched lines:")
+                for ln in lines:
+                    print(ln)
+            else:
+                raw = (arp_diag.get("arp_raw") or "").strip()
+                if raw:
+                    print("[ARP][VERBOSE] arp -a raw output:")
+                    print(raw)
+
+            print("[ARP][VERBOSE] MAC->IP mapping:")
+            for mac in sorted(arp_map.keys()):
+                print(f"{mac} -> {arp_map[mac]}")
+
+            print("[ARP][VERBOSE] CSV MAC lookup:")
+            for r in rows:
+                mac = r.get("mac") or ""
+                ip = arp_map.get(mac, "")
+                if ip:
+                    print(f"FOUND {mac} -> {ip}")
+                else:
+                    print(f"NOT FOUND {mac}")
+            print("")
+
+        for r in rows:
+            mac = r["mac"]
+            ip = arp_map.get(mac, "")
+            if ip:
+                r["ip"] = ip
+                r["ip_found"] = True
+                r["status"] = "IP_FOUND"
     else:
         if not args.subnet:
-            print("Errore: specificare --subnet oppure --single-ip", file=sys.stderr)
+            print("Errore: specificare --subnet oppure --single-ip oppure --arp-only", file=sys.stderr)
             return 2
 
         subnet = ipaddress.ip_network(args.subnet, strict=False)
@@ -1121,11 +1251,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[SCAN] Scansione subnet {subnet}...")
         ok_count = ping_sweep(subnet, workers=args.workers)
 
-        arp_map, arp_err = read_arp_table()
+        arp_map, arp_err, arp_diag = read_arp_table()
         if arp_err:
-            print(f"[ARP] Errore lettura tabella ARP: {arp_err}")
+            print(f"[ARP] Errore lettura tabella ARP/neighbor: {arp_err}")
         print(f"[SCAN] Ping sweep completato: {ok_count} host rispondono")
-        print(f"[ARP] Trovati {len(arp_map)} dispositivi nella tabella ARP")
+        print(f"[ARP] Trovati {len(arp_map)} dispositivi nella tabella ARP/neighbor")
+
+        if args.verbose_arp:
+            print("")
+            print(f"[ARP][VERBOSE] ARP righe parse: {int(arp_diag.get('arp_parsed_lines') or 0)}")
+            neighbor_rows = int(arp_diag.get("neighbor_rows") or 0)
+            print(f"[ARP][VERBOSE] Neighbor entries: {neighbor_rows}")
+            neighbor_err = (arp_diag.get("neighbor_error") or "").strip()
+            if neighbor_err:
+                print(f"[ARP][VERBOSE] Neighbor error: {neighbor_err}")
+
+            lines = arp_diag.get("arp_matched_lines") or []
+            if lines:
+                print("[ARP][VERBOSE] arp -a matched lines:")
+                for ln in lines:
+                    print(ln)
+            else:
+                raw = (arp_diag.get("arp_raw") or "").strip()
+                if raw:
+                    print("[ARP][VERBOSE] arp -a raw output:")
+                    print(raw)
+
+            print("[ARP][VERBOSE] MAC->IP mapping:")
+            for mac in sorted(arp_map.keys()):
+                print(f"{mac} -> {arp_map[mac]}")
+
+            print("[ARP][VERBOSE] CSV MAC lookup:")
+            for r in rows:
+                mac = r.get("mac") or ""
+                ip = arp_map.get(mac, "")
+                if ip:
+                    print(f"FOUND {mac} -> {ip}")
+                else:
+                    print(f"NOT FOUND {mac}")
+            print("")
 
         for r in rows:
             mac = r["mac"]
