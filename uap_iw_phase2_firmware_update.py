@@ -15,9 +15,9 @@ from typing import Dict, List, Optional, Tuple
 
 
 SCRIPT_NAME = "uap_iw_phase2_firmware_update.py"
-SCRIPT_VERSION = "0.4.0"
+SCRIPT_VERSION = "0.4.2"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 2 firmware update with offline dry-run and plink/pscp -hostkey support"
+SCRIPT_SUMMARY = "Phase 2 firmware update with fixed remote upgrade command and plink/pscp -hostkey support"
 
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
@@ -831,12 +831,43 @@ def process_one_ap(
 
     row["upload_ok"] = True
 
+    chk_out, chk_err, chk_rc, chk_exc = run_plink(
+        plink_path=plink_path,
+        host=ip,
+        user=user,
+        password=password,
+        command="ls -l /tmp/fwupdate.bin /bin/syswrapper.sh",
+        timeout=timeout,
+        batch=True,
+        stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
+    )
+    if chk_exc:
+        row["status"] = "UPDATE_FAILED_COMMAND"
+        row["error"] = "plink timeout" if chk_exc == "timeout" else chk_exc
+        return row
+    if chk_rc != 0:
+        combined = ((chk_out or "") + "\n" + (chk_err or "")).lower()
+        fw_missing = ("/tmp/fwupdate.bin" in combined) and ("no such file" in combined or "not found" in combined)
+        sys_missing = ("/bin/syswrapper.sh" in combined) and ("no such file" in combined or "not found" in combined)
+        if fw_missing:
+            row["status"] = "UPDATE_FAILED_UPLOAD"
+            row["error"] = "FWUPDATE_BIN_MISSING"
+            return row
+        if sys_missing:
+            row["status"] = "UPDATE_FAILED_COMMAND"
+            row["error"] = "SYSWRAPPER_MISSING"
+            return row
+        row["status"] = "UPDATE_FAILED_COMMAND"
+        row["error"] = (chk_err or chk_out or "PRE_UPGRADE_CHECK_FAILED").strip()
+        return row
+
     up_out, up_err, up_rc, up_exc = run_plink(
         plink_path=plink_path,
         host=ip,
         user=user,
         password=password,
-        command='"/bin/syswrapper.sh upgrade2 &"',
+        command="sh -c '/bin/syswrapper.sh upgrade2 >/tmp/upgrade.log 2>&1 &'",
         timeout=timeout,
         batch=True,
         stdin_data="\n",
