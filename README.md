@@ -81,6 +81,14 @@ pip install -r requirements.txt
 
 Su un PC remoto Windows (PowerShell), puoi preparare l’ambiente anche senza clonare il repository: lo script scarica i file necessari dal repository pubblico e prepara `.venv` senza richiedere `Activate.ps1`.
 
+Caratteristiche:
+- `winget` è opzionale: se presente viene usato come primo tentativo.
+- Se `winget` manca o fallisce:
+  - Python viene installato scaricando l’installer ufficiale da `python.org` in `.\downloads\python-installer.exe` (installazione silenziosa per utente corrente, senza admin).
+  - PuTTY viene installato scaricando l’MSI ufficiale in `.\downloads\putty-installer.msi` (se l’MSI fallisce, fallback su `plink.exe`/`pscp.exe` standalone in `.\tools\putty\`).
+- Non richiede Git.
+- `aps.csv` non deve stare nel repository: trasferiscilo separatamente sul PC remoto.
+
 Esempio in una cartella vuota:
 
 ```powershell
@@ -93,9 +101,6 @@ Esempio in una cartella già clonata:
 ```powershell
 .\setup_windows.ps1
 ```
-
-Nota:
-- `aps.csv` non deve stare nel repository: trasferiscilo separatamente sul PC remoto.
 
 ## Esempio CSV
 
