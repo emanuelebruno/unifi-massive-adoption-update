@@ -192,9 +192,14 @@ Input:
 - report prodotto dalla Fase 1 (preferibilmente JSON)
 - firmware locale nella cartella `.\firmware\`
 
+Nota host key PuTTY:
+- La Fase 1 produce `hostkey_fingerprint` (es. `SHA256:...`).
+- La Fase 2 usa sempre `-hostkey <fingerprint>` con `plink.exe` e `pscp.exe` quando la fingerprint è disponibile.
+- Non viene usato alcun enrollment interattivo e non viene scritta la cache host key di PuTTY (Registry).
+
 ### Dry-run (default)
 
-Senza `--execute` lo script non carica firmware, non avvia upgrade e non scrive nella cache PuTTY.
+Senza `--execute` lo script non esegue comandi `plink`/`pscp`: valida report (modello/versione/fingerprint) e produce lo status `DRY_RUN_UPDATE_REQUIRED` oppure gli skip pertinenti (es. `SKIPPED_HOSTKEY_FINGERPRINT_MISSING`).
 
 ```powershell
 python .\uap_iw_phase2_firmware_update.py `

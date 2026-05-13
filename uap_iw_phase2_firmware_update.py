@@ -144,6 +144,7 @@ def run_plink(
     timeout: int,
     batch: bool,
     stdin_data: Optional[str],
+    hostkey_fingerprint: Optional[str] = None,
 ) -> Tuple[str, str, Optional[int], Optional[str]]:
     resolved = resolve_executable(plink_path)
     if not resolved:
@@ -152,6 +153,8 @@ def run_plink(
     cmd = [resolved, "-ssh", "-P", "22", "-l", user, "-pw", password]
     if batch:
         cmd.append("-batch")
+    if hostkey_fingerprint:
+        cmd.extend(["-hostkey", hostkey_fingerprint])
     cmd.extend([host, command])
 
     try:
@@ -181,6 +184,7 @@ def run_pscp_upload(
     local_file: str,
     remote_path: str,
     timeout: int,
+    hostkey_fingerprint: Optional[str] = None,
 ) -> Tuple[str, str, Optional[int], Optional[str]]:
     resolved = resolve_executable(pscp_path)
     if not resolved:
@@ -194,9 +198,13 @@ def run_pscp_upload(
         "-scp",
         "-pw",
         password,
+    ]
+    if hostkey_fingerprint:
+        cmd.extend(["-hostkey", hostkey_fingerprint])
+    cmd.extend(
         local_file,
         f"{user}@{host}:{remote_path}",
-    ]
+    )
 
     try:
         proc = subprocess.run(
@@ -376,9 +384,10 @@ def init_phase2_row(rec: Dict[str, object]) -> Dict[str, object]:
         "board_shortname": (rec.get("board_shortname") or "").strip(),
         "device_model": (rec.get("device_model") or "").strip(),
         "model_family_status": (rec.get("model_family_status") or "").strip(),
-        "hostkey_status": "HOSTKEY_NOT_CHECKED",
+        "hostkey_status": (rec.get("hostkey_status") or "HOSTKEY_NOT_CHECKED").strip(),
         "hostkey_auto_accepted": False,
         "hostkey_error_type": "",
+        "hostkey_fingerprint": (rec.get("hostkey_fingerprint") or "").strip(),
         "action": "",
         "upload_ok": False,
         "upgrade_started": False,
@@ -391,7 +400,7 @@ def init_phase2_row(rec: Dict[str, object]) -> Dict[str, object]:
 
 
 def plink_probe(
-    plink_path: str, ip: str, user: str, password: str, timeout: int
+    plink_path: str, ip: str, user: str, password: str, timeout: int, hostkey_fingerprint: Optional[str]
 ) -> Tuple[bool, str, str, str]:
     out, err, rc, exc = run_plink(
         plink_path=plink_path,
@@ -402,6 +411,7 @@ def plink_probe(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     if exc:
         if exc == "timeout":
@@ -419,39 +429,13 @@ def plink_probe(
     return False, "HOSTKEY_NOT_CHECKED", err_type or "SSH_ERROR", (err or out or "").strip()
 
 
-def enroll_putty_hostkey(
-    plink_path: str, ip: str, user: str, password: str, timeout: int
-) -> Tuple[bool, str, str]:
-    out, err, rc, exc = run_plink(
-        plink_path=plink_path,
-        host=ip,
-        user=user,
-        password=password,
-        command="echo ENROLL_OK",
-        timeout=timeout,
-        batch=False,
-        stdin_data="y\n\n",
-    )
-    if exc:
-        if exc == "timeout":
-            return False, "SSH_TIMEOUT", "plink enroll timeout"
-        return False, "SSH_PLINK_ERROR", exc
-
-    if rc == 0:
-        return True, "", ""
-
-    hk_status, hk_error = classify_putty_hostkey(out, err)
-    if hk_error == "SSH_HOSTKEY_MISMATCH":
-        return False, "SSH_HOSTKEY_MISMATCH", (err or out or "").strip()
-    if hk_error == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
-        return False, "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT", (err or out or "").strip()
-
-    err_type = classify_putty_error(out, err, rc)
-    return False, err_type or "SSH_ERROR", (err or out or "").strip()
-
-
 def confirm_board_info(
-    plink_path: str, ip: str, user: str, password: str, timeout: int
+    plink_path: str,
+    ip: str,
+    user: str,
+    password: str,
+    timeout: int,
+    hostkey_fingerprint: Optional[str],
 ) -> Tuple[bool, Dict[str, str], str, str]:
     out, err, rc, exc = run_plink(
         plink_path=plink_path,
@@ -462,6 +446,7 @@ def confirm_board_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     if exc:
         if exc == "timeout":
@@ -480,6 +465,7 @@ def read_post_info(
     user: str,
     password: str,
     timeout: int,
+    hostkey_fingerprint: Optional[str],
 ) -> Tuple[Dict[str, str], Optional[str]]:
     out_v, err_v, rc_v, exc_v = run_plink(
         plink_path=plink_path,
@@ -490,6 +476,7 @@ def read_post_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     if exc_v or rc_v != 0:
         err_type = classify_putty_error(out_v, err_v, rc_v)
@@ -506,6 +493,7 @@ def read_post_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     board = {}
     if not exc_b and rc_b == 0 and out_b:
@@ -520,6 +508,7 @@ def read_post_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     mca = {}
     if not exc_m and rc_m == 0 and out_m:
@@ -541,6 +530,7 @@ def wait_for_reboot_and_back_online(
     user: str,
     password: str,
     per_command_timeout: int,
+    hostkey_fingerprint: Optional[str],
 ) -> Tuple[bool, bool, str]:
     deadline = time.monotonic() + max(1, timeout_seconds)
     reboot_detected = False
@@ -561,7 +551,14 @@ def wait_for_reboot_and_back_online(
             time.sleep(2)
             continue
 
-        ok, _, err_type, err = plink_probe(plink_path, ip, user=user, password=password, timeout=per_command_timeout)
+        ok, _, err_type, err = plink_probe(
+            plink_path,
+            ip,
+            user=user,
+            password=password,
+            timeout=per_command_timeout,
+            hostkey_fingerprint=hostkey_fingerprint,
+        )
         if ok:
             return reboot_detected, True, ""
         if err_type in {"SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT", "SSH_HOSTKEY_MISMATCH"}:
@@ -588,6 +585,7 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "hostkey_status",
         "hostkey_auto_accepted",
         "hostkey_error_type",
+        "hostkey_fingerprint",
         "action",
         "upload_ok",
         "upgrade_started",
@@ -698,12 +696,30 @@ def process_one_ap(
         row["action"] = "NOOP"
         return row
 
+    hostkey_fingerprint = (row.get("hostkey_fingerprint") or "").strip()
+    if not hostkey_fingerprint:
+        row["status"] = "SKIPPED_HOSTKEY_FINGERPRINT_MISSING"
+        row["error"] = "HOSTKEY_FINGERPRINT_MISSING"
+        row["action"] = "NOOP"
+        return row
+
+    if not execute and not hostkey_fingerprint.startswith("SHA256:"):
+        row["status"] = "SKIPPED_HOSTKEY_FINGERPRINT_MISSING"
+        row["error"] = f"HOSTKEY_FINGERPRINT_INVALID={hostkey_fingerprint!r}"
+        row["action"] = "NOOP"
+        return row
+
     if not execute:
         row["status"] = "DRY_RUN_UPDATE_REQUIRED"
         row["action"] = "UPDATE"
         return row
 
     row["action"] = "UPDATE"
+
+    if not hostkey_fingerprint.startswith("SHA256:"):
+        row["status"] = "UPDATE_FAILED_COMMAND"
+        row["error"] = f"HOSTKEY_FINGERPRINT_INVALID={hostkey_fingerprint!r}"
+        return row
 
     plink_resolved = resolve_executable(plink_path)
     pscp_resolved = resolve_executable(pscp_path)
@@ -716,9 +732,12 @@ def process_one_ap(
         row["error"] = f"pscp not found: {pscp_path}"
         return row
 
-    ok_probe, hk_status, hk_error, hk_errmsg = plink_probe(plink_path, ip, user=user, password=password, timeout=timeout)
+    ok_probe, hk_status, hk_error, hk_errmsg = plink_probe(
+        plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
+    )
     if ok_probe:
-        row["hostkey_status"] = "HOSTKEY_ALREADY_CACHED"
+        if not row.get("hostkey_status") or row.get("hostkey_status") == "HOSTKEY_NOT_CHECKED":
+            row["hostkey_status"] = "HOSTKEY_ACCEPTED_VIA_HOSTKEY_OPTION"
         row["hostkey_auto_accepted"] = False
         row["hostkey_error_type"] = ""
     else:
@@ -729,58 +748,14 @@ def process_one_ap(
             row["error"] = hk_errmsg or "HOSTKEY_MISMATCH"
             return row
 
-        if hk_error == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
-            if not accept_new_hostkeys:
-                row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
-                row["hostkey_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
-                row["status"] = "SKIPPED_HOSTKEY_UNKNOWN_NOT_ACCEPTED"
-                row["error"] = hk_errmsg or "HOSTKEY_UNKNOWN"
-                return row
-
-            enroll_ok, enroll_err_type, enroll_err = enroll_putty_hostkey(
-                plink_path, ip, user=user, password=password, timeout=timeout
-            )
-            if not enroll_ok:
-                if enroll_err_type == "SSH_HOSTKEY_MISMATCH":
-                    row["hostkey_status"] = "HOSTKEY_MISMATCH"
-                    row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
-                    row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
-                    row["error"] = enroll_err or "HOSTKEY_MISMATCH"
-                    return row
-                row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
-                row["hostkey_error_type"] = enroll_err_type or "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
-                row["status"] = "UPDATE_FAILED_COMMAND"
-                row["error"] = enroll_err or "HOSTKEY_ENROLL_FAILED"
-                return row
-
-            ok_probe2, hk_status2, hk_error2, hk_errmsg2 = plink_probe(
-                plink_path, ip, user=user, password=password, timeout=timeout
-            )
-            if not ok_probe2:
-                if hk_error2 == "SSH_HOSTKEY_MISMATCH":
-                    row["hostkey_status"] = "HOSTKEY_MISMATCH"
-                    row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
-                    row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
-                    row["error"] = hk_errmsg2 or "HOSTKEY_MISMATCH"
-                    return row
-                row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
-                row["hostkey_error_type"] = hk_error2 or "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
-                row["status"] = "UPDATE_FAILED_COMMAND"
-                row["error"] = hk_errmsg2 or "HOSTKEY_ENROLL_NOT_EFFECTIVE"
-                return row
-
-            row["hostkey_status"] = "HOSTKEY_ACCEPTED_NEW"
-            row["hostkey_auto_accepted"] = True
-            row["hostkey_error_type"] = ""
-        else:
-            row["hostkey_status"] = hk_status or "HOSTKEY_NOT_CHECKED"
-            row["hostkey_error_type"] = hk_error or "SSH_ERROR"
-            row["status"] = "UPDATE_FAILED_COMMAND"
-            row["error"] = hk_errmsg or "SSH_PROBE_FAILED"
-            return row
+        row["hostkey_status"] = row.get("hostkey_status") or "HOSTKEY_NOT_CHECKED"
+        row["hostkey_error_type"] = hk_error or "SSH_ERROR"
+        row["status"] = "UPDATE_FAILED_COMMAND"
+        row["error"] = hk_errmsg or "SSH_PROBE_FAILED"
+        return row
 
     board_ok, board_info, board_err_type, board_err = confirm_board_info(
-        plink_path, ip, user=user, password=password, timeout=timeout
+        plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
     )
     if not board_ok:
         if board_err_type == "SSH_HOSTKEY_MISMATCH":
@@ -822,6 +797,7 @@ def process_one_ap(
         local_file=local_fw,
         remote_path="/tmp/fwupdate.bin",
         timeout=max(10, timeout),
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     if upload_exc:
         row["status"] = "UPDATE_FAILED_UPLOAD"
@@ -850,6 +826,7 @@ def process_one_ap(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     if up_exc:
         row["status"] = "UPDATE_FAILED_COMMAND"
@@ -877,6 +854,7 @@ def process_one_ap(
         user=user,
         password=password,
         per_command_timeout=timeout,
+        hostkey_fingerprint=hostkey_fingerprint,
     )
     row["reboot_detected"] = reboot_detected
     row["device_back_online"] = back_online
@@ -892,7 +870,9 @@ def process_one_ap(
         row["error"] = back_error or "DEVICE_NOT_BACK_ONLINE"
         return row
 
-    post, post_err = read_post_info(plink_path, ip, user=user, password=password, timeout=timeout)
+    post, post_err = read_post_info(
+        plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
+    )
     if post_err:
         row["status"] = "UPDATE_FAILED_POST_CHECK"
         row["error"] = post_err
@@ -1014,6 +994,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "hostkey_status": "HOSTKEY_NOT_CHECKED",
                         "hostkey_auto_accepted": False,
                         "hostkey_error_type": "",
+                        "hostkey_fingerprint": "",
                         "action": "",
                         "upload_ok": False,
                         "upgrade_started": False,

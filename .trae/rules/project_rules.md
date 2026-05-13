@@ -171,14 +171,24 @@ Field tests showed that the following approaches are unreliable with Windows, Py
 
 For UAP-IW mass adoption, the required strategy is to use PuTTY/Plink `-hostkey`.
 
-Flow:
+Rules:
+- Never attempt interactive enrollment, stdin injection, shell piping, or PuTTY registry/cache writes as part of automation.
+- Never auto-accept host key mismatch/changed warnings.
+- Prefer deterministic `-batch -hostkey SHA256:...` for every non-interactive connection.
 
+Flow (Phase 1):
 1. Run an initial safe probe with `plink -batch` and no `-hostkey`.
-
 2. If the probe fails because the host key is unknown/new, parse the fingerprint from PuTTY output.
-
    Example PuTTY output:
-
    ```text
    The server's rsa2 key fingerprint is:
      ssh-rsa 1040 SHA256:dgWrvHcJn/oMXqFXgoiN45xA7+lsPkNOISHvuzAOUjw
+   ```
+3. If `--accept-new-hostkeys` is enabled and the host key is unknown/new:
+   - rerun the same command with `plink -batch -hostkey SHA256:...`
+   - consider the connection trusted only if the batch retry succeeds
+   - record `hostkey_fingerprint` in the Phase 1 report and set `hostkey_status=HOSTKEY_ACCEPTED_VIA_HOSTKEY_OPTION`
+
+Flow (Phase 2):
+- Phase 2 must read `hostkey_fingerprint` from the Phase 1 report and pass it to both `plink.exe` and `pscp.exe` using `-hostkey`.
+- If `hostkey_fingerprint` is missing, Phase 2 must not proceed in execute mode and must report a clear skip status.
