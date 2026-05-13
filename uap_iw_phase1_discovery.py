@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -20,6 +21,7 @@ EXPECTED_FIRMWARE_FAMILY = "BZ.qca933x"
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
 COMPATIBLE_DEVICE_MODELS = {"UAP-InWall"}
+PUTTY_ENROLL_LOCK = threading.Lock()
 
 # Sopprimi log rumorosi di paramiko
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
@@ -623,18 +625,19 @@ def plink_collect_device_info(
                 return result
 
             ssh_debug(verbose, f"[SSH] {host} starting hostkey enrollment (non-batch)")
-            enroll_out, enroll_err, enroll_rc, enroll_exc = run_plink(
-                plink_path=plink_path,
-                host=host,
-                user=user,
-                password=password,
-                command="cat /etc/version",
-                timeout=timeout,
-                batch=False,
-                stdin_data="y\n",
-                verbose=verbose,
-                use_console=True,
-            )
+            with PUTTY_ENROLL_LOCK:
+                enroll_out, enroll_err, enroll_rc, enroll_exc = run_plink(
+                    plink_path=plink_path,
+                    host=host,
+                    user=user,
+                    password=password,
+                    command="cat /etc/version",
+                    timeout=timeout,
+                    batch=False,
+                    stdin_data="y\n\n",
+                    verbose=verbose,
+                    use_console=True,
+                )
             if enroll_exc:
                 if enroll_exc == "timeout":
                     result["ssh_error_type"] = "SSH_TIMEOUT"
@@ -1045,6 +1048,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--timeout", type=int, default=5, help="Timeout SSH (secondi)")
     p.add_argument("--workers", type=int, default=64, help="Worker threads (ping sweep / AP processing)")
     args = p.parse_args(argv)
+
+    if args.accept_new_hostkeys:
+        print("[WARN] --accept-new-hostkeys enabled: PuTTY host key enrollment will be serialized.")
 
     aps = read_input_csv(args.input)
     rows = build_initial_rows(aps)

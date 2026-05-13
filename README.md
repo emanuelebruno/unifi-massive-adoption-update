@@ -153,6 +153,8 @@ oppure:
 
 - abilitare l'accettazione automatica delle sole host key nuove/sconosciute con `--accept-new-hostkeys` (solo in rete controllata).
 
+Quando `--accept-new-hostkeys` è attivo, la fase di enrollment delle host key PuTTY viene serializzata per evitare prompt concorrenti se `--workers` è alto.
+
 ## Esecuzione fase 2 (aggiornamento firmware)
 
 Lo script di Fase 2 è: `uap_iw_phase2_firmware_update.py`.
