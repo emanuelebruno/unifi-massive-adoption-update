@@ -112,6 +112,7 @@ python .\uap_iw_phase1_discovery.py --input .\aps.csv --subnet 192.168.1.0/24 --
 --password ubnt
 --ssh-backend auto|paramiko|plink
 --plink-path plink.exe
+--accept-new-hostkeys
 --out .\reports\report.csv
 --json .\reports\report.json
 --timeout 5
@@ -133,17 +134,23 @@ python .\uap_iw_phase1_discovery.py --input .\aps.csv --single-ip 192.168.0.4 --
 
 #### Host key PuTTY
 
-Lo script non accetta automaticamente host key sconosciute tramite plink. Se la host key non è già salvata nella cache di PuTTY, nel report comparirà l'errore:
+Per impostazione predefinita (senza `--accept-new-hostkeys`) lo script non accetta automaticamente host key sconosciute tramite plink. Se la host key non è già salvata nella cache di PuTTY, nel report comparirà l'errore:
 
 ```text
 SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT
 ```
 
-In quel caso eseguire una prima connessione manuale per salvare la host key:
+In quel caso puoi:
+
+- fare una prima connessione manuale per salvare la host key:
 
 ```powershell
 plink.exe -ssh -P 22 -l ubnt -pw ubnt 192.168.0.4 "cat /etc/version"
 ```
+
+oppure:
+
+- abilitare l'accettazione automatica delle sole host key nuove/sconosciute con `--accept-new-hostkeys` (solo in rete controllata).
 
 ## Esecuzione fase 2 (aggiornamento firmware)
 
@@ -189,7 +196,7 @@ python .\uap_iw_phase2_firmware_update.py `
 
 ### Host key PuTTY e --accept-new-hostkeys
 
-Per impostazione predefinita lo script non accetta automaticamente nuove host key PuTTY.
+Per impostazione predefinita gli script non accettano automaticamente nuove host key PuTTY.
 
 In scenari massivi (AP appena resettati) puoi abilitare l'accettazione automatica delle sole host key nuove/sconosciute con:
 
