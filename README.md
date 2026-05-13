@@ -272,6 +272,51 @@ Note:
 - Le host key mismatch/changed non vengono mai accettate automaticamente.
 - La cache PuTTY è per-utente Windows. Se lo script gira come SYSTEM (es. TacticalRMM) potrebbe non vedere le host key salvate dall'utente interattivo e potrebbe creare/gestire una cache separata.
 
+## Esecuzione fase 3 (set-inform)
+
+Lo script di Fase 3 è: `uap_iw_phase3_set_inform.py`.
+
+Input consigliato:
+- report Fase 2 in modalità execute (es. `phase2_execute_report_*.csv/.json`), perché include post-check firmware e stati più affidabili.
+
+Parametro obbligatorio:
+- `--inform-url` deve essere passato esplicitamente (non è mai hardcoded) e deve contenere `/inform` (es. `http://IP_CONTROLLER:8080/inform`).
+
+Nota:
+- La Fase 3 non fa firmware upload, non fa firmware upgrade, non fa reboot e non fa reset.
+- Per operazioni sul campo, usare `--workers 1` per esecuzione sequenziale.
+
+### Dry-run (default, no-network)
+
+Senza `--execute` lo script non esegue `plink`: valida input/report e produce `DRY_RUN_SET_INFORM_REQUIRED` oppure gli `SKIPPED_*`.
+
+```powershell
+python .\uap_iw_phase3_set_inform.py `
+  --input .\reports\phase2_execute_report.json `
+  --inform-url http://IP_CONTROLLER:8080/inform `
+  --user ubnt --password ubnt `
+  --plink-path plink.exe `
+  --out .\reports\phase3_set_inform_dryrun.csv `
+  --json .\reports\phase3_set_inform_dryrun.json `
+  --workers 1
+```
+
+### Execute (attenzione)
+
+Con `--execute` lo script esegue solo `set-inform` via `plink -batch -hostkey SHA256:...` sugli AP selezionati come sicuri (modello UAP-IW/U2IW verificato, hostkey fingerprint presente, firmware target dove richiesto).
+
+```powershell
+python .\uap_iw_phase3_set_inform.py `
+  --input .\reports\phase2_execute_report.json `
+  --inform-url http://IP_CONTROLLER:8080/inform `
+  --user ubnt --password ubnt `
+  --plink-path plink.exe `
+  --out .\reports\phase3_set_inform_execute.csv `
+  --json .\reports\phase3_set_inform_execute.json `
+  --workers 1 `
+  --execute
+```
+
 ## Note di sicurezza
 
 Non committare:
