@@ -156,19 +156,29 @@ Never assume the access point can be modified unless the current phase explicitl
 
 For Phase 1, all operations must be read-only.
 
-## PuTTY/plink host key enrollment on Windows
+## PuTTY/plink host key handling on Windows
 
-When implementing automatic PuTTY/plink host key enrollment on Windows, do not rely on `subprocess.run(..., input="y\n")` or stdin injection. Field tests showed that plink may still wait at:
+When implementing PuTTY/plink host key handling on Windows, do not rely on interactive host key acceptance.
 
-`Store key in cache? (y/n, Return cancels connection, i for more info)`
+Field tests showed that the following approaches are unreliable with Windows, Python embeddable, standalone plink, remote sessions, and old UAP-IW firmware:
 
-For UAP-IW mass adoption, if `--accept-new-hostkeys` is explicitly enabled and a previous `plink -batch` probe has already classified the error as a NEW/UNKNOWN host key, use a dedicated Windows shell-pipe enrollment command equivalent to:
+- `subprocess.run(..., input="y\n")`
+- stdin injection
+- `echo y|plink.exe`
+- `cmd.exe /c echo y|plink.exe`
+- non-batch interactive enrollment
+- writing the host key into the PuTTY registry/cache as part of the automation
 
-`cmd.exe /c echo y| "<plink.exe>" -ssh -P 22 -l <user> -pw <password> <host> "cat /etc/version"`
+For UAP-IW mass adoption, the required strategy is to use PuTTY/Plink `-hostkey`.
 
-Rules:
-- Never run this blindly before detecting `SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT`.
-- Never auto-accept host key mismatch/changed warnings.
-- Keep enrollment serialized with a global lock; only one non-batch/shell-pipe enrollment may run at a time.
-- Immediately after enrollment, rerun the original command with `plink -batch` and trust success only if the batch retry succeeds.
-- Redact passwords in logs/verbose output.
+Flow:
+
+1. Run an initial safe probe with `plink -batch` and no `-hostkey`.
+
+2. If the probe fails because the host key is unknown/new, parse the fingerprint from PuTTY output.
+
+   Example PuTTY output:
+
+   ```text
+   The server's rsa2 key fingerprint is:
+     ssh-rsa 1040 SHA256:dgWrvHcJn/oMXqFXgoiN45xA7+lsPkNOISHvuzAOUjw
