@@ -13,6 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 
+SCRIPT_NAME = "uap_iw_phase2_firmware_update.py"
+SCRIPT_VERSION = "0.4.0"
+SCRIPT_BUILD_DATE = "2026-05-13"
+SCRIPT_SUMMARY = "Phase 2 firmware update with offline dry-run and plink/pscp -hostkey support"
+
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
 COMPATIBLE_DEVICE_MODELS = {"UAP-InWall"}
@@ -373,6 +378,9 @@ def is_candidate_model(rec: Dict[str, object]) -> bool:
 
 def init_phase2_row(rec: Dict[str, object]) -> Dict[str, object]:
     return {
+        "script_name": SCRIPT_NAME,
+        "script_version": SCRIPT_VERSION,
+        "script_build_date": SCRIPT_BUILD_DATE,
         "mac": (rec.get("mac") or "").strip(),
         "ubicazione": (rec.get("ubicazione") or "").strip(),
         "ip": (rec.get("ip") or "").strip(),
@@ -571,6 +579,9 @@ def wait_for_reboot_and_back_online(
 def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     fieldnames = [
+        "script_name",
+        "script_version",
+        "script_build_date",
         "mac",
         "ubicazione",
         "ip",
@@ -908,7 +919,16 @@ def process_one_ap(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+    if "--version" in argv_list:
+        print(f"Script: {SCRIPT_NAME}")
+        print(f"Version: {SCRIPT_VERSION}")
+        print(f"Build: {SCRIPT_BUILD_DATE}")
+        print(f"Summary: {SCRIPT_SUMMARY}")
+        return 0
+
     p = argparse.ArgumentParser(description="UAP-IW / U2IW Phase 2 firmware update (safe gated).")
+    p.add_argument("--version", action="store_true", help="Stampa versione script ed esce")
     p.add_argument("--input", required=True, help="Report Fase 1 (.json preferito, oppure .csv)")
     p.add_argument("--firmware", required=True, help="Firmware file path (.bin)")
     p.add_argument("--target-version-full", required=True)
@@ -924,7 +944,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--accept-new-hostkeys", action="store_true")
     p.add_argument("--execute", action="store_true")
-    args = p.parse_args(argv)
+    args = p.parse_args(argv_list)
+
+    print(f"[PHASE2] Script: {SCRIPT_NAME} | Version: {SCRIPT_VERSION} | Build: {SCRIPT_BUILD_DATE}")
 
     firmware_path = args.firmware
     if not os.path.exists(firmware_path):
@@ -980,6 +1002,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 processed.append(
                     {
+                        "script_name": SCRIPT_NAME,
+                        "script_version": SCRIPT_VERSION,
+                        "script_build_date": SCRIPT_BUILD_DATE,
                         "mac": "",
                         "ubicazione": "",
                         "ip": "",

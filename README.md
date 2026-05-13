@@ -103,6 +103,28 @@ Esempio in una cartella già clonata:
 .\setup_windows.ps1
 ```
 
+## Versioning
+
+Verificare sempre la versione prima di eseguire discovery/aggiornamenti, soprattutto quando si lavora da PC diversi o da PC remoto.
+
+### Verifica versione Phase 1
+
+```powershell
+.\tools\python-embed\python.exe .\uap_iw_phase1_discovery.py --version
+```
+
+### Verifica versione Phase 2
+
+```powershell
+.\tools\python-embed\python.exe .\uap_iw_phase2_firmware_update.py --version
+```
+
+### Verifica versione setup_windows.ps1
+
+```powershell
+.\setup_windows.ps1 -Version
+```
+
 ## Esempio CSV
 
 Copiare il file di esempio:

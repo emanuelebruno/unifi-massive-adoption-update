@@ -14,8 +14,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import paramiko
+SCRIPT_NAME = "uap_iw_phase1_discovery.py"
+SCRIPT_VERSION = "0.4.0"
+SCRIPT_BUILD_DATE = "2026-05-13"
+SCRIPT_SUMMARY = "Phase 1 discovery with plink -hostkey fingerprint handling"
 
+if __name__ == "__main__" and "--version" in sys.argv[1:]:
+    print(f"Script: {SCRIPT_NAME}")
+    print(f"Version: {SCRIPT_VERSION}")
+    print(f"Build: {SCRIPT_BUILD_DATE}")
+    print(f"Summary: {SCRIPT_SUMMARY}")
+    raise SystemExit(0)
+
+import paramiko
 
 EXPECTED_FIRMWARE_FAMILY = "BZ.qca933x"
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
@@ -810,6 +821,9 @@ def ssh_collect_device_info(
 def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     fieldnames = [
+        "script_name",
+        "script_version",
+        "script_build_date",
         "mac",
         "ubicazione",
         "ip",
@@ -853,6 +867,9 @@ def build_initial_rows(aps: List[APExpected]) -> List[Dict[str, object]]:
     for ap in aps:
         rows.append(
             {
+                "script_name": SCRIPT_NAME,
+                "script_version": SCRIPT_VERSION,
+                "script_build_date": SCRIPT_BUILD_DATE,
                 "mac": ap.mac,
                 "ubicazione": ap.ubicazione,
                 "ip": "",
@@ -1011,7 +1028,16 @@ def summarize(rows: List[Dict[str, object]]) -> Dict[str, int]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+    if "--version" in argv_list:
+        print(f"Script: {SCRIPT_NAME}")
+        print(f"Version: {SCRIPT_VERSION}")
+        print(f"Build: {SCRIPT_BUILD_DATE}")
+        print(f"Summary: {SCRIPT_SUMMARY}")
+        return 0
+
     p = argparse.ArgumentParser(description="UAP-IW / U2IW Phase 1 discovery (read-only).")
+    p.add_argument("--version", action="store_true", help="Stampa versione script ed esce")
     p.add_argument("--input", required=True, help="CSV input (mac, ubicazione)")
     p.add_argument("--subnet", help="Subnet CIDR (es. 192.168.1.0/24)")
     p.add_argument("--single-ip", dest="single_ip", help="Test singolo IP (bypass ARP discovery)")
@@ -1035,7 +1061,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--json", dest="json_out", help="JSON report output (opzionale)")
     p.add_argument("--timeout", type=int, default=5, help="Timeout SSH (secondi)")
     p.add_argument("--workers", type=int, default=64, help="Worker threads (ping sweep / AP processing)")
-    args = p.parse_args(argv)
+    args = p.parse_args(argv_list)
+
+    print(f"[PHASE1] Script: {SCRIPT_NAME} | Version: {SCRIPT_VERSION} | Build: {SCRIPT_BUILD_DATE}")
 
     if args.accept_new_hostkeys:
         print("[INFO] --accept-new-hostkeys enabled: plink will retry with -hostkey (fingerprint extracted from output; no PuTTY cache write).")
@@ -1050,6 +1078,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             rows = [
                 {
+                    "script_name": SCRIPT_NAME,
+                    "script_version": SCRIPT_VERSION,
+                    "script_build_date": SCRIPT_BUILD_DATE,
                     "mac": "",
                     "ubicazione": "MANUAL_TEST",
                     "ip": ip,
@@ -1127,6 +1158,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 processed.append(
                     {
+                        "script_name": SCRIPT_NAME,
+                        "script_version": SCRIPT_VERSION,
+                        "script_build_date": SCRIPT_BUILD_DATE,
                         "mac": "",
                         "ubicazione": "",
                         "ip": "",

@@ -1,3 +1,20 @@
+param(
+    [switch]$Version
+)
+
+$ScriptName = "setup_windows.ps1"
+$ScriptVersion = "0.4.0"
+$ScriptBuildDate = "2026-05-13"
+$ScriptSummary = "Windows bootstrap with GitHub download, Python embeddable fallback and local PuTTY tools"
+
+Write-Host "Setup UAP-IW Tools (Windows)"
+Write-Host ("Version: {0}" -f $ScriptVersion)
+Write-Host ("Build: {0}" -f $ScriptBuildDate)
+
+if ($Version) {
+    exit 0
+}
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
