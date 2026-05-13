@@ -12,9 +12,9 @@ reports/*
 !reports/.gitkeep
 
 # Firmware files should not be committed
-firmware/*
+!firmware/
 !firmware/.gitkeep
-*.bin
+!firmware/BZ.qca933x.v4.3.28.11361.210128.2309.bin
 
 # Logs
 *.log
