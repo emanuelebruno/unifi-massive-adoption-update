@@ -113,6 +113,7 @@ python .\uap_iw_phase1_discovery.py --input .\aps.csv --subnet 192.168.1.0/24 --
 --ssh-backend auto|paramiko|plink
 --plink-path plink.exe
 --accept-new-hostkeys
+--verbose
 --out .\reports\report.csv
 --json .\reports\report.json
 --timeout 5

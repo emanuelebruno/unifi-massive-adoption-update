@@ -379,6 +379,36 @@ def plink_error_type(stdout: str, stderr: str, returncode: Optional[int]) -> str
     return ""
 
 
+def normalize_putty_stdin(stdin_data: Optional[str]) -> Optional[str]:
+    if stdin_data is None:
+        return None
+    system = platform.system().lower()
+    if system.startswith("win"):
+        if "\r\n" in stdin_data:
+            return stdin_data
+        return stdin_data.replace("\n", "\r\n")
+    return stdin_data
+
+
+def redact_putty_cmd(cmd: List[str]) -> str:
+    redacted: List[str] = []
+    i = 0
+    while i < len(cmd):
+        token = cmd[i]
+        redacted.append(token)
+        if token == "-pw" and i + 1 < len(cmd):
+            redacted.append("******")
+            i += 2
+            continue
+        i += 1
+    return " ".join(redacted)
+
+
+def ssh_debug(enabled: bool, msg: str) -> None:
+    if enabled:
+        print(msg)
+
+
 def run_plink(
     plink_path: str,
     host: str,
@@ -388,6 +418,8 @@ def run_plink(
     timeout: int,
     batch: bool,
     stdin_data: Optional[str],
+    verbose: bool,
+    use_console: bool,
 ) -> Tuple[str, str, Optional[int], Optional[str]]:
     resolved = shutil.which(plink_path) if plink_path else None
     if not resolved:
@@ -399,21 +431,35 @@ def run_plink(
     cmd.extend([host, command])
 
     try:
+        stdin_norm = normalize_putty_stdin(stdin_data)
+        system = platform.system().lower()
+        creationflags = 0
+        if system.startswith("win") and not use_console:
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        ssh_debug(verbose, f"[SSH] {host} run: {redact_putty_cmd(cmd)}")
         proc = subprocess.run(
             cmd,
-            input=stdin_data,
+            input=stdin_norm,
             capture_output=True,
             text=True,
             timeout=max(1, timeout),
             check=False,
-            creationflags=(subprocess.CREATE_NO_WINDOW if platform.system().lower().startswith("win") else 0),
+            creationflags=creationflags,
         )
         out = clean_plink_output(proc.stdout or "")
         err = clean_plink_output(proc.stderr or "")
+        ssh_debug(verbose, f"[SSH] {host} rc={proc.returncode}")
+        if out:
+            ssh_debug(verbose, f"[SSH] {host} stdout: {out}")
+        if err:
+            ssh_debug(verbose, f"[SSH] {host} stderr: {err}")
         return out, err, proc.returncode, None
     except subprocess.TimeoutExpired:
+        ssh_debug(verbose, f"[SSH] {host} timeout")
         return "", "", None, "timeout"
     except Exception as e:
+        ssh_debug(verbose, f"[SSH] {host} exception: {e}")
         return "", "", None, str(e)
 
 
@@ -504,7 +550,13 @@ def paramiko_collect_device_info(host: str, user: str, password: str, timeout: i
 
 
 def plink_collect_device_info(
-    host: str, user: str, password: str, timeout: int, plink_path: str, accept_new_hostkeys: bool
+    host: str,
+    user: str,
+    password: str,
+    timeout: int,
+    plink_path: str,
+    accept_new_hostkeys: bool,
+    verbose: bool,
 ) -> Dict[str, object]:
     result: Dict[str, object] = {
         "ssh_ok": False,
@@ -535,6 +587,8 @@ def plink_collect_device_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        verbose=verbose,
+        use_console=False,
     )
     if v_exc:
         if v_exc == "timeout":
@@ -548,6 +602,7 @@ def plink_collect_device_info(
     if v_rc != 0:
         hk_status, hk_error = classify_putty_hostkey(v_out, v_err)
         if hk_error == "SSH_HOSTKEY_MISMATCH":
+            ssh_debug(verbose, f"[SSH] {host} detected HOSTKEY_MISMATCH (batch)")
             result["ssh_error_type"] = "SSH_HOSTKEY_MISMATCH"
             result["hostkey_status"] = "HOSTKEY_MISMATCH"
             result["hostkey_auto_accepted"] = False
@@ -556,15 +611,18 @@ def plink_collect_device_info(
             return result
 
         if hk_error == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
+            ssh_debug(verbose, f"[SSH] {host} detected HOSTKEY_UNKNOWN (batch)")
             result["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
             result["hostkey_auto_accepted"] = False
             result["hostkey_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
 
             if not accept_new_hostkeys:
+                ssh_debug(verbose, f"[SSH] {host} auto-accept disabled (--accept-new-hostkeys not set)")
                 result["ssh_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
                 result["error"] = (v_err or v_out or "HOSTKEY_UNKNOWN").strip()
                 return result
 
+            ssh_debug(verbose, f"[SSH] {host} starting hostkey enrollment (non-batch)")
             enroll_out, enroll_err, enroll_rc, enroll_exc = run_plink(
                 plink_path=plink_path,
                 host=host,
@@ -574,6 +632,8 @@ def plink_collect_device_info(
                 timeout=timeout,
                 batch=False,
                 stdin_data="y\n",
+                verbose=verbose,
+                use_console=True,
             )
             if enroll_exc:
                 if enroll_exc == "timeout":
@@ -588,12 +648,15 @@ def plink_collect_device_info(
 
             enroll_hk_status, enroll_hk_error = classify_putty_hostkey(enroll_out, enroll_err)
             if enroll_hk_error == "SSH_HOSTKEY_MISMATCH":
+                ssh_debug(verbose, f"[SSH] {host} enrollment detected HOSTKEY_MISMATCH")
                 result["ssh_error_type"] = "SSH_HOSTKEY_MISMATCH"
                 result["hostkey_status"] = "HOSTKEY_MISMATCH"
                 result["hostkey_auto_accepted"] = False
                 result["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
                 result["error"] = (enroll_err or enroll_out or "HOSTKEY_MISMATCH").strip()
                 return result
+            if enroll_hk_error == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
+                ssh_debug(verbose, f"[SSH] {host} enrollment still reports HOSTKEY_UNKNOWN")
 
             if enroll_rc != 0:
                 result["ssh_error_type"] = plink_error_type(enroll_out, enroll_err, enroll_rc) or "SSH_ERROR"
@@ -601,6 +664,7 @@ def plink_collect_device_info(
                 result["hostkey_error_type"] = result["ssh_error_type"]
                 return result
 
+            ssh_debug(verbose, f"[SSH] {host} post-enrollment batch retry")
             v_out2, v_err2, v_rc2, v_exc2 = run_plink(
                 plink_path=plink_path,
                 host=host,
@@ -610,6 +674,8 @@ def plink_collect_device_info(
                 timeout=timeout,
                 batch=True,
                 stdin_data="\n",
+                verbose=verbose,
+                use_console=False,
             )
             if v_exc2:
                 if v_exc2 == "timeout":
@@ -624,6 +690,7 @@ def plink_collect_device_info(
 
             hk_status2, hk_error2 = classify_putty_hostkey(v_out2, v_err2)
             if hk_error2 == "SSH_HOSTKEY_MISMATCH":
+                ssh_debug(verbose, f"[SSH] {host} post-enrollment batch detected HOSTKEY_MISMATCH")
                 result["ssh_error_type"] = "SSH_HOSTKEY_MISMATCH"
                 result["hostkey_status"] = "HOSTKEY_MISMATCH"
                 result["hostkey_auto_accepted"] = False
@@ -631,6 +698,7 @@ def plink_collect_device_info(
                 result["error"] = (v_err2 or v_out2 or "HOSTKEY_MISMATCH").strip()
                 return result
             if hk_error2 == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
+                ssh_debug(verbose, f"[SSH] {host} post-enrollment batch still reports HOSTKEY_UNKNOWN")
                 result["ssh_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
                 result["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
                 result["hostkey_auto_accepted"] = False
@@ -641,11 +709,9 @@ def plink_collect_device_info(
             if v_rc2 != 0:
                 result["ssh_error_type"] = plink_error_type(v_out2, v_err2, v_rc2) or "SSH_ERROR"
                 result["error"] = (v_err2 or v_out2 or "plink command failed (after hostkey enroll)").strip()
-                result["hostkey_status"] = "HOSTKEY_ACCEPTED_NEW"
-                result["hostkey_auto_accepted"] = True
-                result["hostkey_error_type"] = ""
                 return result
 
+            ssh_debug(verbose, f"[SSH] {host} hostkey enrollment successful")
             result["hostkey_status"] = "HOSTKEY_ACCEPTED_NEW"
             result["hostkey_auto_accepted"] = True
             result["hostkey_error_type"] = ""
@@ -674,6 +740,8 @@ def plink_collect_device_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        verbose=verbose,
+        use_console=False,
     )
     if not b_exc and b_rc == 0 and b_out:
         b = parse_board_info_extended(b_out)
@@ -690,6 +758,8 @@ def plink_collect_device_info(
         timeout=timeout,
         batch=True,
         stdin_data="\n",
+        verbose=verbose,
+        use_console=False,
     )
     if not m_exc and m_rc == 0 and m_out:
         m = parse_mca_info_extended(m_out)
@@ -715,6 +785,7 @@ def ssh_collect_device_info(
     ssh_backend: str,
     plink_path: str,
     accept_new_hostkeys: bool,
+    verbose: bool,
 ) -> Dict[str, object]:
     backend = (ssh_backend or "auto").strip().lower()
     if backend not in {"auto", "paramiko", "plink"}:
@@ -724,13 +795,25 @@ def ssh_collect_device_info(
         return paramiko_collect_device_info(host, user=user, password=password, timeout=timeout)
     if backend == "plink":
         return plink_collect_device_info(
-            host, user=user, password=password, timeout=timeout, plink_path=plink_path, accept_new_hostkeys=accept_new_hostkeys
+            host,
+            user=user,
+            password=password,
+            timeout=timeout,
+            plink_path=plink_path,
+            accept_new_hostkeys=accept_new_hostkeys,
+            verbose=verbose,
         )
 
     res = paramiko_collect_device_info(host, user=user, password=password, timeout=timeout)
     if not res.get("ssh_ok") and res.get("ssh_error_type") == "SSH_LEGACY_HOSTKEY_UNSUPPORTED_BY_PARAMIKO":
         return plink_collect_device_info(
-            host, user=user, password=password, timeout=timeout, plink_path=plink_path, accept_new_hostkeys=accept_new_hostkeys
+            host,
+            user=user,
+            password=password,
+            timeout=timeout,
+            plink_path=plink_path,
+            accept_new_hostkeys=accept_new_hostkeys,
+            verbose=verbose,
         )
     return res
 
@@ -819,6 +902,7 @@ def process_one_ap(
     ssh_backend: str,
     plink_path: str,
     accept_new_hostkeys: bool,
+    verbose: bool,
 ) -> Dict[str, object]:
     row = dict(base_row)
     ip = (row.get("ip") or "").strip()
@@ -845,6 +929,7 @@ def process_one_ap(
         ssh_backend=ssh_backend,
         plink_path=plink_path,
         accept_new_hostkeys=accept_new_hostkeys,
+        verbose=verbose,
     )
     row["ssh_ok"] = bool(info.get("ssh_ok"))
     row["ssh_backend"] = info.get("ssh_backend") or ""
@@ -949,6 +1034,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Accetta automaticamente solo nuove host key PuTTY (solo backend plink; non accetta mismatch)",
     )
+    p.add_argument(
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        help="Stampa log dettagliati (comandi/rc/stdout/stderr) per debug SSH/plink",
+    )
     p.add_argument("--out", required=True, help="CSV report output")
     p.add_argument("--json", dest="json_out", help="JSON report output (opzionale)")
     p.add_argument("--timeout", type=int, default=5, help="Timeout SSH (secondi)")
@@ -1031,6 +1122,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.ssh_backend,
                 args.plink_path,
                 args.accept_new_hostkeys,
+                args.verbose,
             )
             for r in rows
         ]
