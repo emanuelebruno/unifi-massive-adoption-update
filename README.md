@@ -33,7 +33,7 @@ Firmware previsto:
 BZ.qca933x.v4.3.28.11361.210128.2309.bin
 ```
 
-Il firmware non è incluso nel repository.
+Il firmware è incluso nel repository.
 
 ### Fase 3 — Set-inform
 
@@ -63,6 +63,9 @@ uap-iw-tools/
 ├── aps.example.csv
 ├── .gitignore
 ├── requirements.txt
+├── setup_windows.ps1
+├── uap_iw_phase1_discovery.py
+├── uap_iw_phase2_firmware_update.py
 └── README.md
 ```
 
@@ -73,6 +76,26 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+### Setup Windows rapido da repository pubblico
+
+Su un PC remoto Windows (PowerShell), puoi preparare l’ambiente anche senza clonare il repository: lo script scarica i file necessari dal repository pubblico e prepara `.venv` senza richiedere `Activate.ps1`.
+
+Esempio in una cartella vuota:
+
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/emanuelebruno/unifi-massive-adoption-update/main/setup_windows.ps1 -OutFile .\setup_windows.ps1
+powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1
+```
+
+Esempio in una cartella già clonata:
+
+```powershell
+.\setup_windows.ps1
+```
+
+Nota:
+- `aps.csv` non deve stare nel repository: trasferiscilo separatamente sul PC remoto.
 
 ## Esempio CSV
 
