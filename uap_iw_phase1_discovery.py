@@ -465,6 +465,88 @@ def run_plink(
         return "", "", None, str(e)
 
 
+def escape_cmd_exe_value(value: str) -> str:
+    s = value or ""
+    s = s.replace("^", "^^")
+    s = s.replace("&", "^&")
+    s = s.replace("|", "^|")
+    s = s.replace("<", "^<")
+    s = s.replace(">", "^>")
+    s = s.replace('"', '^"')
+    return s
+
+
+def run_plink_hostkey_enroll_via_shell_pipe(
+    plink_path: str,
+    host: str,
+    user: str,
+    password: str,
+    command: str,
+    timeout: int,
+    verbose: bool,
+    use_console: bool,
+) -> Tuple[str, str, Optional[int], Optional[str]]:
+    resolved = shutil.which(plink_path) if plink_path else None
+    if not resolved:
+        return "", "", None, f"plink not found: {plink_path}"
+
+    system = platform.system().lower()
+    if not system.startswith("win"):
+        return run_plink(
+            plink_path=resolved,
+            host=host,
+            user=user,
+            password=password,
+            command=command,
+            timeout=timeout,
+            batch=False,
+            stdin_data="y\n\n",
+            verbose=verbose,
+            use_console=use_console,
+        )
+
+    plink_q = f'"{resolved}"'
+    host_q = f'"{escape_cmd_exe_value(host)}"'
+    user_q = f'"{escape_cmd_exe_value(user)}"'
+    cmd_q = f'"{escape_cmd_exe_value(command)}"'
+    pw_q = f'"{escape_cmd_exe_value(password)}"'
+    pw_redacted_q = '"******"'
+
+    plink_args_actual = f"{plink_q} -ssh -P 22 -l {user_q} -pw {pw_q} {host_q} {cmd_q}"
+    plink_args_redacted = f"{plink_q} -ssh -P 22 -l {user_q} -pw {pw_redacted_q} {host_q} {cmd_q}"
+    cmdline_actual = f"echo y| {plink_args_actual}"
+    cmdline_redacted = f"echo y| {plink_args_redacted}"
+
+    creationflags = 0
+    if system.startswith("win") and not use_console:
+        creationflags = subprocess.CREATE_NO_WINDOW
+
+    ssh_debug(verbose, f"[SSH] {host} enroll via shell pipe: cmd.exe /c {cmdline_redacted}")
+    try:
+        proc = subprocess.run(
+            ["cmd.exe", "/c", cmdline_actual],
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout),
+            check=False,
+            creationflags=creationflags,
+        )
+        out = clean_plink_output(proc.stdout or "")
+        err = clean_plink_output(proc.stderr or "")
+        ssh_debug(verbose, f"[SSH] {host} rc={proc.returncode}")
+        if out:
+            ssh_debug(verbose, f"[SSH] {host} stdout: {out}")
+        if err:
+            ssh_debug(verbose, f"[SSH] {host} stderr: {err}")
+        return out, err, proc.returncode, None
+    except subprocess.TimeoutExpired:
+        ssh_debug(verbose, f"[SSH] {host} timeout")
+        return "", "", None, "timeout"
+    except Exception as e:
+        ssh_debug(verbose, f"[SSH] {host} exception: {e}")
+        return "", "", None, str(e)
+
+
 def paramiko_collect_device_info(host: str, user: str, password: str, timeout: int) -> Dict[str, object]:
     result: Dict[str, object] = {
         "ssh_ok": False,
@@ -626,17 +708,15 @@ def plink_collect_device_info(
 
             ssh_debug(verbose, f"[SSH] {host} starting hostkey enrollment (non-batch)")
             with PUTTY_ENROLL_LOCK:
-                enroll_out, enroll_err, enroll_rc, enroll_exc = run_plink(
+                enroll_out, enroll_err, enroll_rc, enroll_exc = run_plink_hostkey_enroll_via_shell_pipe(
                     plink_path=plink_path,
                     host=host,
                     user=user,
                     password=password,
                     command="cat /etc/version",
                     timeout=timeout,
-                    batch=False,
-                    stdin_data="y\n\n",
                     verbose=verbose,
-                    use_console=True,
+                    use_console=False,
                 )
             if enroll_exc:
                 if enroll_exc == "timeout":

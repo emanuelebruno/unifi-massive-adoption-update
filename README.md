@@ -182,7 +182,7 @@ oppure:
 
 - abilitare l'accettazione automatica delle sole host key nuove/sconosciute con `--accept-new-hostkeys` (solo in rete controllata).
 
-Quando `--accept-new-hostkeys` è attivo, la fase di enrollment delle host key PuTTY viene serializzata per evitare prompt concorrenti se `--workers` è alto.
+Quando `--accept-new-hostkeys` è attivo, la fase di enrollment delle host key PuTTY viene serializzata per evitare prompt concorrenti se `--workers` è alto. Su Windows l'enrollment usa una pipe shell equivalente a `echo y| plink.exe ...` per evitare problemi di stdin con alcuni runtime (es. Python embeddable) e con plink standalone.
 
 ## Esecuzione fase 2 (aggiornamento firmware)
 

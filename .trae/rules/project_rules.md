@@ -155,3 +155,20 @@ Reports should include:
 Never assume the access point can be modified unless the current phase explicitly allows it.
 
 For Phase 1, all operations must be read-only.
+
+## PuTTY/plink host key enrollment on Windows
+
+When implementing automatic PuTTY/plink host key enrollment on Windows, do not rely on `subprocess.run(..., input="y\n")` or stdin injection. Field tests showed that plink may still wait at:
+
+`Store key in cache? (y/n, Return cancels connection, i for more info)`
+
+For UAP-IW mass adoption, if `--accept-new-hostkeys` is explicitly enabled and a previous `plink -batch` probe has already classified the error as a NEW/UNKNOWN host key, use a dedicated Windows shell-pipe enrollment command equivalent to:
+
+`cmd.exe /c echo y| "<plink.exe>" -ssh -P 22 -l <user> -pw <password> <host> "cat /etc/version"`
+
+Rules:
+- Never run this blindly before detecting `SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT`.
+- Never auto-accept host key mismatch/changed warnings.
+- Keep enrollment serialized with a global lock; only one non-batch/shell-pipe enrollment may run at a time.
+- Immediately after enrollment, rerun the original command with `plink -batch` and trust success only if the batch retry succeeds.
+- Redact passwords in logs/verbose output.
