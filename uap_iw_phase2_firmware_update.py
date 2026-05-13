@@ -315,7 +315,7 @@ def evaluate_model_family(board_name: str, board_shortname: str, device_model: s
 def read_input_report(path: str) -> List[Dict[str, object]]:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".json":
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if not isinstance(data, list):
             raise ValueError("JSON report: atteso array di oggetti")
