@@ -161,6 +161,8 @@ python .\uap_iw_phase1_discovery.py --input .\aps.csv --subnet 192.168.1.0/24 --
 --single-ip 192.168.1.50
 --arp-only
 --verbose-arp
+--require-ping
+--ping-timeout-ms 1000
 --user ubnt
 --password ubnt
 --ssh-backend auto|paramiko|plink

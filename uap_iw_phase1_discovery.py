@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 SCRIPT_NAME = "uap_iw_phase1_discovery.py"
-SCRIPT_VERSION = "0.4.1"
+SCRIPT_VERSION = "0.4.2"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 1 discovery with robust Windows ARP/neighbor discovery and plink -hostkey fingerprint handling"
+SCRIPT_SUMMARY = "Phase 1 discovery with robust ARP/neighbor discovery, non-blocking ping, and plink -hostkey support"
 
 if __name__ == "__main__" and "--version" in sys.argv[1:]:
     print(f"Script: {SCRIPT_NAME}")
@@ -88,10 +88,10 @@ def read_input_csv(path: str) -> List[APExpected]:
     return aps
 
 
-def ping_host(ip: str) -> bool:
+def ping_host(ip: str, timeout_ms: int, verbose: bool) -> bool:
     system = platform.system().lower()
     if system.startswith("win"):
-        cmd = ["ping", "-n", "1", "-w", "500", ip]
+        cmd = ["ping", "-n", "1", "-w", str(max(1, int(timeout_ms))), ip]
     else:
         cmd = ["ping", "-c", "1", "-W", "1", ip]
 
@@ -103,19 +103,23 @@ def ping_host(ip: str) -> bool:
             check=False,
             creationflags=(subprocess.CREATE_NO_WINDOW if system.startswith("win") else 0),
         )
+        if verbose:
+            print(f"[PING] cmd={cmd} rc={proc.returncode}")
         return proc.returncode == 0
     except Exception:
+        if verbose:
+            print(f"[PING] cmd={cmd} rc=EXCEPTION")
         return False
 
 
-def ping_sweep(subnet: ipaddress.IPv4Network, workers: int) -> int:
+def ping_sweep(subnet: ipaddress.IPv4Network, workers: int, timeout_ms: int) -> int:
     hosts = [str(ip) for ip in subnet.hosts()]
     ok_count = 0
     if not hosts:
         return 0
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futures = [ex.submit(ping_host, ip) for ip in hosts]
+        futures = [ex.submit(ping_host, ip, timeout_ms, False) for ip in hosts]
         for fut in as_completed(futures):
             try:
                 if fut.result():
@@ -908,6 +912,7 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "ip",
         "ip_found",
         "ping_ok",
+        "ping_warning",
         "ssh_ok",
         "ssh_backend",
         "ssh_error_type",
@@ -954,6 +959,7 @@ def build_initial_rows(aps: List[APExpected]) -> List[Dict[str, object]]:
                 "ip": "",
                 "ip_found": False,
                 "ping_ok": False,
+                "ping_warning": "",
                 "ssh_ok": False,
                 "ssh_backend": "",
                 "ssh_error_type": "",
@@ -988,6 +994,8 @@ def process_one_ap(
     ssh_backend: str,
     plink_path: str,
     accept_new_hostkeys: bool,
+    require_ping: bool,
+    ping_timeout_ms: int,
     verbose: bool,
 ) -> Dict[str, object]:
     row = dict(base_row)
@@ -999,13 +1007,15 @@ def process_one_ap(
 
     row["ip_found"] = True
 
-    if not ping_host(ip):
-        row["ping_ok"] = False
-        row["status"] = "PING_FAILED"
-        row["error"] = row.get("error") or "Ping failed"
-        return row
-
-    row["ping_ok"] = True
+    row["ping_ok"] = ping_host(ip, ping_timeout_ms, verbose)
+    row["ping_warning"] = ""
+    if not row["ping_ok"]:
+        if require_ping:
+            row["status"] = "PING_FAILED"
+            row["error"] = row.get("error") or "Ping failed"
+            return row
+        if verbose:
+            print("PING failed, trying SSH anyway because --require-ping is not set")
 
     info = ssh_collect_device_info(
         ip,
@@ -1041,6 +1051,13 @@ def process_one_ap(
 
     if not row["ssh_ok"]:
         row["status"] = "IP_FOUND_SSH_FAILED"
+        errors = []
+        if not row.get("ping_ok"):
+            errors.append("Ping failed")
+        ssh_err = (row.get("error") or "").strip()
+        if ssh_err:
+            errors.append(ssh_err)
+        row["error"] = "; ".join(errors) if errors else (row.get("error") or "")
         return row
 
     if not (row.get("firmware_version_short") or "").strip():
@@ -1056,6 +1073,10 @@ def process_one_ap(
     if row.get("model_family_status") == "MODEL_FAMILY_UNKNOWN":
         row["status"] = "MODEL_FAMILY_UNKNOWN"
         return row
+
+    if not row.get("ping_ok"):
+        row["ping_warning"] = "PING_FAILED_BUT_SSH_OK"
+        row["error"] = ""
 
     row["status"] = "IP_FOUND_SSH_OK"
     return row
@@ -1122,6 +1143,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--single-ip", dest="single_ip", help="Test singolo IP (bypass ARP discovery)")
     p.add_argument("--arp-only", dest="arp_only", action="store_true", help="Modalità ARP-only: niente ping sweep subnet")
     p.add_argument("--verbose-arp", dest="verbose_arp", action="store_true", help="Stampa diagnostica ARP/neighbor")
+    p.add_argument("--require-ping", dest="require_ping", action="store_true", help="Se attivo: ping fail blocca SSH (legacy behavior)")
+    p.add_argument(
+        "--ping-timeout-ms",
+        dest="ping_timeout_ms",
+        type=int,
+        default=(1000 if platform.system().lower().startswith("win") else 1000),
+        help="Timeout ping in millisecondi (Windows: -w)",
+    )
     p.add_argument("--user", default="ubnt", help="SSH username (default ubnt)")
     p.add_argument("--password", default="ubnt", help="SSH password (default ubnt)")
     p.add_argument("--ssh-backend", dest="ssh_backend", default="auto", choices=["auto", "paramiko", "plink"])
@@ -1167,6 +1196,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "ip": ip,
                     "ip_found": True,
                     "ping_ok": False,
+                    "ping_warning": "",
                     "ssh_ok": False,
                     "ssh_backend": "",
                     "ssh_error_type": "",
@@ -1249,7 +1279,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
         print(f"[SCAN] Scansione subnet {subnet}...")
-        ok_count = ping_sweep(subnet, workers=args.workers)
+        ok_count = ping_sweep(subnet, workers=args.workers, timeout_ms=args.ping_timeout_ms)
 
         arp_map, arp_err, arp_diag = read_arp_table()
         if arp_err:
@@ -1312,6 +1342,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.ssh_backend,
                 args.plink_path,
                 args.accept_new_hostkeys,
+                args.require_ping,
+                args.ping_timeout_ms,
                 args.verbose,
             )
             for r in rows
@@ -1330,6 +1362,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "ip": "",
                         "ip_found": False,
                         "ping_ok": False,
+                        "ping_warning": "",
                         "ssh_ok": False,
                         "ssh_backend": "",
                         "ssh_error_type": "",
