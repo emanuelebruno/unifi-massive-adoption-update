@@ -64,7 +64,7 @@ function Download-Url {
 
     if ($hasBits) {
         try {
-            Start-BitsTransfer -Source $Url -Destination $DestinationPath -ErrorAction Stop
+            Start-BitsTransfer -Source $Url -Destination $DestinationPath -ErrorAction Stop | Out-Null
         } catch {
             if (Test-Path -LiteralPath $DestinationPath) {
                 Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
@@ -76,7 +76,7 @@ function Download-Url {
     if (-not $hasBits) {
         $iwrParams = @{ Uri = $Url; OutFile = $DestinationPath; ErrorAction = 'Stop' }
         if ($PSVersionTable.PSVersion.Major -lt 6) { $iwrParams.UseBasicParsing = $true }
-        Invoke-WebRequest @iwrParams
+        Invoke-WebRequest @iwrParams | Out-Null
     }
 
     if (-not (Test-Path -LiteralPath $DestinationPath)) { return $false }
@@ -113,7 +113,7 @@ function Try-Install-WithWinget {
         return $false
     }
 
-    & winget install $PackageId --silent --accept-package-agreements --accept-source-agreements
+    & winget install $PackageId --silent --accept-package-agreements --accept-source-agreements | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host ("WARNING: winget install {0} fallito (exit code: {1}), uso installer diretto." -f $PackageId, $LASTEXITCODE)
         return $false
@@ -247,9 +247,9 @@ function Ensure-PythonEmbedded {
     $ok = Download-Url -Url 'https://bootstrap.pypa.io/get-pip.py' -DestinationPath $getPipPath
     if (-not $ok) { throw 'Impossibile scaricare get-pip.py.' }
 
-    & $embedPython $getPipPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "get-pip.py fallito (exit code: $LASTEXITCODE)."
+    $proc = Start-Process -FilePath $embedPython -ArgumentList @($getPipPath) -Wait -PassThru -NoNewWindow
+    if ($proc.ExitCode -ne 0) {
+        throw "get-pip.py fallito (exit code: $($proc.ExitCode))."
     }
 
     & $embedPython -m pip --version | Out-Null
@@ -260,6 +260,28 @@ function Ensure-PythonEmbedded {
     $script:UsingPythonEmbed = $true
     $script:PythonEmbedExe = $embedPython
     return $embedPython
+}
+
+function Assert-ValidPythonLauncher([string]$PythonLauncher) {
+    if (-not $PythonLauncher) { throw 'Python non disponibile: variabile PythonLauncher vuota.' }
+    if ($PythonLauncher -match "(`r|`n)") { throw "PythonLauncher non valido (contiene newline): $PythonLauncher" }
+    if ($PythonLauncher -match '(?i)Collecting|Downloading|Installing collected packages') {
+        throw "PythonLauncher non valido (contiene output pip): $PythonLauncher"
+    }
+
+    $trimmed = $PythonLauncher.Trim()
+    if ($trimmed -ieq 'python' -or $trimmed -ieq 'py') {
+        $cmd = Get-Command $trimmed -ErrorAction SilentlyContinue
+        if (-not $cmd) { throw "Comando $trimmed non trovato in PATH." }
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $trimmed)) {
+        throw "PythonLauncher non valido (path non trovato): $trimmed"
+    }
+    if ($trimmed -notmatch '(?i)\.exe$') {
+        throw "PythonLauncher non valido (non è un .exe): $trimmed"
+    }
 }
 
 function Ensure-Python {
@@ -465,7 +487,11 @@ try {
 
 Write-Section 'Python'
 $pythonLauncher = Ensure-Python
-& $pythonLauncher --version
+Assert-ValidPythonLauncher -PythonLauncher $pythonLauncher
+if ($script:UsingPythonEmbed) {
+    if (-not (Test-Path -LiteralPath $pythonLauncher)) { throw "Python embeddable non trovato: $pythonLauncher" }
+}
+& $pythonLauncher --version | Out-Host
 
 Write-Section 'PuTTY'
 Ensure-Putty
@@ -481,17 +507,13 @@ if (Test-Path -LiteralPath $venvPython) {
     if (Test-Path -LiteralPath '.\.venv') {
         throw 'La cartella .venv esiste ma .venv\Scripts\python.exe non è presente. Elimina .venv e riesegui.'
     }
-    try {
-        & $pythonLauncher -m venv .venv
+    if ($script:UsingPythonEmbed) {
+        $useVenv = $false
+        Write-Host 'WARNING: uso Python embeddable: proseguo senza venv.'
+    } else {
+        & $pythonLauncher -m venv .venv | Out-Host
         if (-not (Test-Path -LiteralPath $venvPython)) {
             throw 'Creazione venv fallita: .venv\Scripts\python.exe non trovato.'
-        }
-    } catch {
-        if ($script:UsingPythonEmbed) {
-            $useVenv = $false
-            Write-Host 'WARNING: venv non creabile con Python embeddable. Proseguo senza venv.'
-        } else {
-            throw
         }
     }
 }
@@ -499,14 +521,14 @@ if (Test-Path -LiteralPath $venvPython) {
 Write-Section 'Install requirements'
 $pythonForInstall = $venvPython
 if (-not $useVenv) { $pythonForInstall = $pythonLauncher }
-& $pythonForInstall -m pip install -r .\requirements.txt
+& $pythonForInstall -m pip install -r .\requirements.txt | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "pip install fallito (exit code: $LASTEXITCODE)."
 }
 
 Write-Section 'py_compile'
-& $pythonForInstall -m py_compile .\uap_iw_phase1_discovery.py
-& $pythonForInstall -m py_compile .\uap_iw_phase2_firmware_update.py
+& $pythonForInstall -m py_compile .\uap_iw_phase1_discovery.py | Out-Host
+& $pythonForInstall -m py_compile .\uap_iw_phase2_firmware_update.py | Out-Host
 
 Write-Section 'Verifica finale firmware'
 if (-not (Test-Path -LiteralPath $firmwareLocal)) {
