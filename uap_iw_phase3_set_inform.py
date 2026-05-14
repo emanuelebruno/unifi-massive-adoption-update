@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,14 +16,36 @@ from typing import Dict, List, Optional, Tuple
 
 
 SCRIPT_NAME = "uap_iw_phase3_set_inform.py"
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.1.1"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 3 set-inform for verified UAP-IW devices using plink -hostkey"
+SCRIPT_SUMMARY = "Phase 3 set-inform for verified UAP-IW devices using plink -hostkey with live progress"
 
 
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
 COMPATIBLE_DEVICE_MODELS = {"UAP-InWall"}
+
+PRINT_LOCK = threading.Lock()
+
+
+def now_hhmmss() -> str:
+    return time.strftime("%H:%M:%S", time.localtime())
+
+
+def progress_print(
+    enabled: bool,
+    ap_index: int,
+    ap_total: int,
+    mac: str,
+    ip: str,
+    ubicazione: str,
+    message: str,
+) -> None:
+    if not enabled:
+        return
+    prefix = f"[{now_hhmmss()}] [AP {ap_index}/{ap_total}] {mac} - {ip} - {ubicazione} - {message}"
+    with PRINT_LOCK:
+        print(prefix, flush=True)
 
 
 def coerce_bool(value: object) -> bool:
@@ -391,10 +414,16 @@ def probe_read_only(
     password: str,
     timeout: int,
     verbose: bool,
+    progress_enabled: bool,
+    ap_index: int,
+    ap_total: int,
+    mac: str,
+    ubicazione: str,
 ) -> Tuple[Dict[str, object], Optional[str]]:
     ip = (row.get("ip") or "").strip()
     hk = (row.get("hostkey_fingerprint") or "").strip()
 
+    progress_print(progress_enabled, ap_index, ap_total, mac, ip, ubicazione, "cat /etc/version")
     out_v, err_v, rc_v, exc_v = run_plink(
         plink_path=plink_path,
         host=ip,
@@ -411,6 +440,7 @@ def probe_read_only(
         return {}, msg or "probe version failed"
     fw_short = (out_v.splitlines()[0].strip() if out_v else "")
 
+    progress_print(progress_enabled, ap_index, ap_total, mac, ip, ubicazione, "cat /etc/board.info")
     out_b, err_b, rc_b, exc_b = run_plink(
         plink_path=plink_path,
         host=ip,
@@ -427,6 +457,7 @@ def probe_read_only(
         return {"pre_firmware_version_short": fw_short}, msg or "probe board.info failed"
     board = parse_board_info_extended(out_b)
 
+    progress_print(progress_enabled, ap_index, ap_total, mac, ip, ubicazione, "mca-cli-op info pre")
     out_m, err_m, rc_m, exc_m = run_plink(
         plink_path=plink_path,
         host=ip,
@@ -501,14 +532,25 @@ def execute_one_ap(
     post_check_attempts: int,
     execute: bool,
     verbose: bool,
+    ap_index: int,
+    ap_total: int,
+    progress_enabled: bool,
+    progress_interval: int,
 ) -> Dict[str, object]:
     dry_run = not execute
     row = init_phase3_row(rec, inform_url, target_version_full, dry_run=dry_run)
+    enabled = bool(progress_enabled) and bool(execute)
+    mac = (row.get("mac") or "").strip()
+    ip = (row.get("ip") or "").strip()
+    ubicazione = (row.get("ubicazione") or "").strip()
+
+    progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, "START")
     eligible, status, reason = decide_phase3(rec, kind, target_version_full, allow_non_target_firmware)
     if not eligible:
         row["status"] = status
         row["error"] = reason
         row["action"] = "NOOP"
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"SKIP {status} ({reason})")
         return row
 
     row["action"] = "SET_INFORM"
@@ -516,7 +558,20 @@ def execute_one_ap(
     if dry_run:
         return row
 
-    probe, probe_err = probe_read_only(row, plink_path, user, password, timeout, verbose)
+    progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, "probe read-only started")
+    probe, probe_err = probe_read_only(
+        row,
+        plink_path,
+        user,
+        password,
+        timeout,
+        verbose,
+        enabled,
+        ap_index,
+        ap_total,
+        mac,
+        ubicazione,
+    )
     if probe:
         for k in ("board_name", "board_shortname", "device_model", "pre_firmware_version_short", "pre_firmware_version_full", "pre_inform_status"):
             if k in probe and (probe.get(k) or "") != "":
@@ -524,21 +579,26 @@ def execute_one_ap(
     if probe_err:
         row["status"] = "SET_INFORM_FAILED_COMMAND"
         row["error"] = probe_err
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})")
         return row
 
+    progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, "model/firmware recheck")
     mf = evaluate_model_family(row.get("board_name") or "", row.get("board_shortname") or "", row.get("device_model") or "")
     if mf != "MODEL_FAMILY_OK":
         row["status"] = "SKIPPED_MODEL_FAMILY_NOT_OK"
         row["error"] = f"MODEL_RECHECK={mf}"
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})")
         return row
 
     fw_full = (row.get("pre_firmware_version_full") or "").strip()
     if fw_full and fw_full != target_version_full and not allow_non_target_firmware:
         row["status"] = "SKIPPED_FIRMWARE_NOT_TARGET"
         row["error"] = f"FIRMWARE_NOT_TARGET={fw_full}"
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})")
         return row
 
     cmd = build_set_inform_command(inform_url)
+    progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, "starting set-inform")
     out_s, err_s, rc_s, exc_s = run_plink(
         plink_path=plink_path,
         host=row["ip"],
@@ -553,33 +613,42 @@ def execute_one_ap(
     if exc_s:
         row["status"] = "SET_INFORM_FAILED_COMMAND"
         row["error"] = "plink timeout" if exc_s == "timeout" else exc_s
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"set-inform failed ({row['error']})")
         return row
     if rc_s != 0:
         err_type = classify_putty_error(out_s, err_s, rc_s)
         msg = (err_s or out_s or "set-inform failed").strip()
         row["status"] = "SET_INFORM_FAILED_COMMAND"
         row["error"] = err_type + (f": {msg}" if msg else "") if err_type else msg
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"set-inform failed ({row['error']})")
         return row
 
     row["set_inform_ok"] = True
+    progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, "set-inform command completed")
 
     attempts = max(1, int(post_check_attempts))
     delay = max(0, int(post_check_delay))
     last_err = ""
     for i in range(attempts):
-        if delay and i > 0:
-            time.sleep(delay)
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check attempt {i+1}/{attempts}...")
         st, err = post_check_info(row, plink_path, user, password, timeout, verbose)
         if err:
             last_err = err
+            progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check attempt failed: {err}")
+            if delay and i < (attempts - 1):
+                progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"waiting {delay}s before next post-check...")
+                time.sleep(delay)
             continue
         row["post_inform_status"] = st
         row["status"] = "SET_INFORM_COMPLETED"
         row["error"] = ""
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check OK: {st}")
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"completed {row['status']}")
         return row
 
     row["status"] = "SET_INFORM_FAILED_POST_CHECK"
     row["error"] = last_err or "post-check failed"
+    progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})")
     return row
 
 
@@ -647,6 +716,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--post-check-delay", type=int, default=3, dest="post_check_delay")
     p.add_argument("--post-check-attempts", type=int, default=1, dest="post_check_attempts")
     p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--progress", action="store_true", help="Enable live progress (execute: default ON)")
+    p.add_argument("--no-progress", action="store_true", help="Disable live progress (execute)")
+    p.add_argument("--progress-interval", dest="progress_interval", type=int, default=5)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv_list)
@@ -674,10 +746,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.allow_non_target_firmware:
         print("[PHASE3] WARNING: --allow-non-target-firmware enabled")
 
+    progress_enabled = False
+    if args.no_progress:
+        progress_enabled = False
+    elif args.progress:
+        progress_enabled = True
+    elif args.execute:
+        progress_enabled = True
+
+    progress_interval = max(1, int(args.progress_interval))
+    if args.execute:
+        print(f"[PHASE3] Progress: {'ON' if progress_enabled else 'OFF'} (interval={progress_interval}s)")
+
     processed: List[Dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         fut_to_rec = {}
-        for rec in records:
+        total = len(records)
+        for idx, rec in enumerate(records, start=1):
             fut = ex.submit(
                 execute_one_ap,
                 rec,
@@ -693,18 +778,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.post_check_attempts,
                 args.execute,
                 args.verbose,
+                idx,
+                total,
+                progress_enabled,
+                progress_interval,
             )
-            fut_to_rec[fut] = rec
+            fut_to_rec[fut] = (rec, idx, total)
 
         for fut in as_completed(list(fut_to_rec.keys())):
             try:
                 processed.append(fut.result())
             except Exception as e:
-                rec = fut_to_rec.get(fut) or {}
+                rec, idx, total = fut_to_rec.get(fut) or ({}, 0, 0)
                 row = init_phase3_row(rec, args.inform_url, args.target_version_full, dry_run=not args.execute)
                 row["status"] = "ERROR"
                 row["error"] = f"Unhandled exception: {type(e).__name__}: {e}"
                 processed.append(row)
+                progress_print(
+                    progress_enabled and bool(args.execute),
+                    int(idx or 0),
+                    int(total or 0),
+                    (row.get("mac") or "").strip(),
+                    (row.get("ip") or "").strip(),
+                    (row.get("ubicazione") or "").strip(),
+                    f"FAILED ERROR ({row['error']})",
+                )
                 if args.verbose:
                     print(traceback.format_exc().strip(), file=sys.stderr)
 
@@ -741,4 +839,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

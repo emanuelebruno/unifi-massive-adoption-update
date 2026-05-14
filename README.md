@@ -296,6 +296,12 @@ Nota:
 - La Fase 3 non fa firmware upload, non fa firmware upgrade, non fa reboot e non fa reset.
 - Per operazioni sul campo, usare `--workers 1` per esecuzione sequenziale.
 
+Opzioni progress (execute):
+- progress live è attivo di default in `--execute`
+- `--no-progress` disabilita l'output live
+- `--progress` forza l'abilitazione
+- `--progress-interval 5` controlla l'intervallo (secondi) dei messaggi periodici
+
 ### Dry-run (default, no-network)
 
 Senza `--execute` lo script non esegue `plink`: valida input/report e produce `DRY_RUN_SET_INFORM_REQUIRED` oppure gli `SKIPPED_*`.
