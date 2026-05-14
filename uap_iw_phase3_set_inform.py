@@ -16,9 +16,9 @@ from typing import Dict, List, Optional, Tuple
 
 
 SCRIPT_NAME = "uap_iw_phase3_set_inform.py"
-SCRIPT_VERSION = "0.1.1"
+SCRIPT_VERSION = "0.1.2"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 3 set-inform for verified UAP-IW devices using plink -hostkey with live progress"
+SCRIPT_SUMMARY = "Phase 3 set-inform with live progress and strict inform URL post-check"
 
 
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
@@ -497,7 +497,7 @@ def post_check_info(
     password: str,
     timeout: int,
     verbose: bool,
-) -> Tuple[str, Optional[str]]:
+) -> Dict[str, str]:
     ip = (row.get("ip") or "").strip()
     hk = (row.get("hostkey_fingerprint") or "").strip()
     out_m, err_m, rc_m, exc_m = run_plink(
@@ -513,9 +513,13 @@ def post_check_info(
         msg = exc_m or (err_m or out_m or "").strip()
         if verbose:
             print(f"[POST] mca-cli-op info rc={rc_m} exc={exc_m} msg={msg}")
-        return "", msg or "post-check mca-cli-op info failed"
+        return {"inform_status": "", "raw_info": (out_m or "").strip(), "error": msg or "post-check mca-cli-op info failed"}
     mca = parse_mca_info_extended(out_m)
-    return (mca.get("inform_status") or "").strip(), None
+    return {
+        "inform_status": (mca.get("inform_status") or "").strip(),
+        "raw_info": (out_m or "").strip(),
+        "error": "",
+    }
 
 
 def execute_one_ap(
@@ -629,9 +633,13 @@ def execute_one_ap(
     attempts = max(1, int(post_check_attempts))
     delay = max(0, int(post_check_delay))
     last_err = ""
+    last_status = ""
     for i in range(attempts):
         progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check attempt {i+1}/{attempts}...")
-        st, err = post_check_info(row, plink_path, user, password, timeout, verbose)
+        info = post_check_info(row, plink_path, user, password, timeout, verbose)
+        err = (info.get("error") or "").strip()
+        st = (info.get("inform_status") or "").strip()
+        raw = (info.get("raw_info") or "").strip()
         if err:
             last_err = err
             progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check attempt failed: {err}")
@@ -639,15 +647,36 @@ def execute_one_ap(
                 progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"waiting {delay}s before next post-check...")
                 time.sleep(delay)
             continue
+
+        last_status = st
         row["post_inform_status"] = st
+        confirmed = (inform_url in st) or (inform_url in raw)
+        if not confirmed:
+            progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check not confirmed yet: status={st}")
+            if delay and i < (attempts - 1):
+                progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"waiting {delay}s before next post-check...")
+                time.sleep(delay)
+            continue
+
         row["status"] = "SET_INFORM_COMPLETED"
         row["error"] = ""
-        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check OK: {st}")
+        progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"post-check OK: inform URL confirmed; status={st}")
         progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"completed {row['status']}")
         return row
 
     row["status"] = "SET_INFORM_FAILED_POST_CHECK"
-    row["error"] = last_err or "post-check failed"
+    row["error"] = "INFORM_URL_NOT_CONFIRMED"
+    if last_status:
+        row["post_inform_status"] = last_status
+    progress_print(
+        enabled,
+        ap_index,
+        ap_total,
+        mac,
+        ip,
+        ubicazione,
+        f"post-check failed: inform URL not confirmed; last_status={row.get('post_inform_status') or ''}",
+    )
     progress_print(enabled, ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})")
     return row
 
@@ -713,8 +742,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--out", required=True, help="CSV report output")
     p.add_argument("--json", dest="json_out", help="JSON report output (optional)")
     p.add_argument("--timeout", type=int, default=10)
-    p.add_argument("--post-check-delay", type=int, default=3, dest="post_check_delay")
-    p.add_argument("--post-check-attempts", type=int, default=1, dest="post_check_attempts")
+    p.add_argument("--post-check-delay", type=int, default=5, dest="post_check_delay")
+    p.add_argument("--post-check-attempts", type=int, default=5, dest="post_check_attempts")
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--progress", action="store_true", help="Enable live progress (execute: default ON)")
     p.add_argument("--no-progress", action="store_true", help="Disable live progress (execute)")
