@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,13 +16,35 @@ from typing import Dict, List, Optional, Tuple
 
 
 SCRIPT_NAME = "uap_iw_phase2_firmware_update.py"
-SCRIPT_VERSION = "0.4.3"
+SCRIPT_VERSION = "0.4.4"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 2 firmware update with non-blocking ping gate, upload timeout/retries, and plink/pscp -hostkey support"
+SCRIPT_SUMMARY = "Phase 2 firmware update with live progress, non-blocking ping gate, upload timeout/retries, and plink/pscp -hostkey support"
 
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
 COMPATIBLE_DEVICE_MODELS = {"UAP-InWall"}
+
+PRINT_LOCK = threading.Lock()
+
+
+def now_hhmmss() -> str:
+    return time.strftime("%H:%M:%S", time.localtime())
+
+
+def progress_print(
+    ap_index: int,
+    ap_total: int,
+    mac: str,
+    ip: str,
+    ubicazione: str,
+    message: str,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    prefix = f"[{now_hhmmss()}] [AP {ap_index}/{ap_total}] {mac} - {ip} - {ubicazione} - {message}"
+    with PRINT_LOCK:
+        print(prefix, flush=True)
 
 
 def coerce_bool(value: object) -> bool:
@@ -544,9 +567,17 @@ def wait_for_reboot_and_back_online(
     password: str,
     per_command_timeout: int,
     hostkey_fingerprint: Optional[str],
+    ap_index: int,
+    ap_total: int,
+    mac: str,
+    ubicazione: str,
+    progress_enabled: bool,
+    progress_interval: int,
 ) -> Tuple[bool, bool, str]:
+    start = time.monotonic()
     deadline = time.monotonic() + max(1, timeout_seconds)
     reboot_detected = False
+    last_progress = 0.0
 
     initial_ok = ping_host(ip)
     if not initial_ok:
@@ -554,13 +585,39 @@ def wait_for_reboot_and_back_online(
 
     down_deadline = min(deadline, time.monotonic() + max(10, min(90, timeout_seconds // 3 or 90)))
     while time.monotonic() < down_deadline:
+        now = time.monotonic()
+        if progress_enabled and (now - last_progress) >= max(1, int(progress_interval)):
+            elapsed = int(now - start)
+            progress_print(
+                ap_index,
+                ap_total,
+                mac,
+                ip,
+                ubicazione,
+                f"still waiting... phase=waiting for down/reboot elapsed {elapsed}s / timeout {timeout_seconds}s",
+                True,
+            )
+            last_progress = now
         if not ping_host(ip):
             reboot_detected = True
             break
         time.sleep(2)
 
     while time.monotonic() < deadline:
+        now = time.monotonic()
         if not ping_host(ip):
+            if progress_enabled and (now - last_progress) >= max(1, int(progress_interval)):
+                elapsed = int(now - start)
+                progress_print(
+                    ap_index,
+                    ap_total,
+                    mac,
+                    ip,
+                    ubicazione,
+                    f"still waiting... phase=waiting ping online elapsed {elapsed}s / timeout {timeout_seconds}s",
+                    True,
+                )
+                last_progress = now
             time.sleep(2)
             continue
 
@@ -576,6 +633,19 @@ def wait_for_reboot_and_back_online(
             return reboot_detected, True, ""
         if err_type in {"SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT", "SSH_HOSTKEY_MISMATCH"}:
             return reboot_detected, False, err_type
+        if progress_enabled and (now - last_progress) >= max(1, int(progress_interval)):
+            elapsed = int(now - start)
+            why = err_type or err or "SSH not ready"
+            progress_print(
+                ap_index,
+                ap_total,
+                mac,
+                ip,
+                ubicazione,
+                f"still waiting... phase=waiting SSH probe elapsed {elapsed}s / timeout {timeout_seconds}s ({why})",
+                True,
+            )
+            last_progress = now
         time.sleep(3)
 
     return reboot_detected, False, "UPDATE_FAILED_DEVICE_NOT_BACK_ONLINE"
@@ -641,16 +711,25 @@ def process_one_ap(
     reboot_timeout: int,
     accept_new_hostkeys: bool,
     execute: bool,
+    ap_index: int,
+    ap_total: int,
+    progress_enabled: bool,
+    progress_interval: int,
 ) -> Dict[str, object]:
     row = init_phase2_row(rec)
     ip = row["ip"]
     row["action"] = "NOOP"
+    mac = (row.get("mac") or "").strip()
+    ubicazione = (row.get("ubicazione") or "").strip()
+
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "START UPDATE", progress_enabled and bool(execute))
 
     try:
         if row["mac"]:
             row["mac"] = normalize_mac(row["mac"])
     except Exception:
         pass
+    mac = (row.get("mac") or "").strip()
 
     ip_found = coerce_bool(rec.get("ip_found"))
     ssh_ok = coerce_bool(rec.get("ssh_ok"))
@@ -663,6 +742,7 @@ def process_one_ap(
     if not ip_found or not ip:
         row["status"] = "SKIPPED_IP_NOT_FOUND"
         row["error"] = "IP_NOT_FOUND"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     try:
@@ -670,31 +750,37 @@ def process_one_ap(
     except Exception:
         row["status"] = "SKIPPED_IP_NOT_FOUND"
         row["error"] = "IP_INVALID"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if not ssh_ok:
         row["status"] = "SKIPPED_SSH_NOT_OK"
         row["error"] = "SSH_NOT_OK"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if model_family_status == "MODEL_FAMILY_MISMATCH":
         row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH"
         row["error"] = "MODEL_FAMILY_MISMATCH"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if model_family_status == "MODEL_FAMILY_UNKNOWN" or not model_family_status:
         row["status"] = "SKIPPED_MODEL_FAMILY_UNKNOWN"
         row["error"] = "MODEL_FAMILY_UNKNOWN"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if model_family_status != "MODEL_FAMILY_OK":
         row["status"] = "SKIPPED_MODEL_FAMILY_UNKNOWN"
         row["error"] = f"MODEL_FAMILY_STATUS_UNEXPECTED={model_family_status}"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if not is_candidate_model(rec):
         row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH"
         row["error"] = "MODEL_FIELDS_NOT_MATCHING_UAP_IW_U2IW"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     action, version_status = decide_version_action(
@@ -707,11 +793,13 @@ def process_one_ap(
     if version_status == "SKIPPED_ALREADY_UPDATED":
         row["status"] = "SKIPPED_ALREADY_UPDATED"
         row["action"] = "NOOP"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']}", progress_enabled and bool(execute))
         return row
 
     if version_status == "SKIPPED_VERSION_FULL_UNKNOWN_BUT_SHORT_MATCHES":
         row["status"] = "SKIPPED_VERSION_FULL_UNKNOWN_BUT_SHORT_MATCHES"
         row["action"] = "NOOP"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']}", progress_enabled and bool(execute))
         return row
 
     hostkey_fingerprint = (row.get("hostkey_fingerprint") or "").strip()
@@ -719,12 +807,14 @@ def process_one_ap(
         row["status"] = "SKIPPED_HOSTKEY_FINGERPRINT_MISSING"
         row["error"] = "HOSTKEY_FINGERPRINT_MISSING"
         row["action"] = "NOOP"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if not execute and not hostkey_fingerprint.startswith("SHA256:"):
         row["status"] = "SKIPPED_HOSTKEY_FINGERPRINT_MISSING"
         row["error"] = f"HOSTKEY_FINGERPRINT_INVALID={hostkey_fingerprint!r}"
         row["action"] = "NOOP"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     if not execute:
@@ -737,6 +827,7 @@ def process_one_ap(
     if not hostkey_fingerprint.startswith("SHA256:"):
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = f"HOSTKEY_FINGERPRINT_INVALID={hostkey_fingerprint!r}"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     plink_resolved = resolve_executable(plink_path)
@@ -744,12 +835,15 @@ def process_one_ap(
     if not plink_resolved:
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = f"plink not found: {plink_path}"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
     if not pscp_resolved:
         row["status"] = "UPDATE_FAILED_UPLOAD"
         row["error"] = f"pscp not found: {pscp_path}"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "SSH probe...", progress_enabled and bool(execute))
     ok_probe, hk_status, hk_error, hk_errmsg = plink_probe(
         plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
     )
@@ -764,14 +858,17 @@ def process_one_ap(
             row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
             row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
             row["error"] = hk_errmsg or "HOSTKEY_MISMATCH"
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
 
         row["hostkey_status"] = row.get("hostkey_status") or "HOSTKEY_NOT_CHECKED"
         row["hostkey_error_type"] = hk_error or "SSH_ERROR"
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = hk_errmsg or "SSH_PROBE_FAILED"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "board.info recheck...", progress_enabled and bool(execute))
     board_ok, board_info, board_err_type, board_err = confirm_board_info(
         plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
     )
@@ -781,15 +878,18 @@ def process_one_ap(
             row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
             row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
             row["error"] = board_err or "HOSTKEY_MISMATCH"
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         if board_err_type == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
             row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
             row["hostkey_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
             row["status"] = "SKIPPED_HOSTKEY_UNKNOWN_NOT_ACCEPTED"
             row["error"] = board_err or "HOSTKEY_UNKNOWN"
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = board_err or board_err_type or "BOARD_INFO_READ_FAILED"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     bn = board_info.get("board_name") or ""
@@ -801,6 +901,7 @@ def process_one_ap(
         row["model_family_status"] = mf
         row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH" if mf == "MODEL_FAMILY_MISMATCH" else "SKIPPED_MODEL_FAMILY_UNKNOWN"
         row["error"] = f"MODEL_RECHECK={mf}"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     row["board_name"] = bn
@@ -813,6 +914,15 @@ def process_one_ap(
     last_msg = ""
     upload_ok = False
     for attempt in range(1, max(1, int(upload_retries)) + 1):
+        progress_print(
+            ap_index,
+            ap_total,
+            mac,
+            ip,
+            ubicazione,
+            f"upload firmware attempt {attempt}/{max(1, int(upload_retries))} started (timeout {max(10, int(upload_timeout))}s)",
+            progress_enabled and bool(execute),
+        )
         upload_attempts = attempt
         upload_out, upload_err, upload_rc, upload_exc = run_pscp_upload(
             pscp_path=pscp_path,
@@ -836,6 +946,7 @@ def process_one_ap(
             upload_ok = True
             last_err_type = ""
             last_msg = ""
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, "upload firmware OK", progress_enabled and bool(execute))
             break
         else:
             last_err_type = classify_putty_error(upload_out, upload_err, upload_rc)
@@ -862,10 +973,20 @@ def process_one_ap(
             row["error"] = f"pscp timeout after {upload_attempts} attempt(s)"
         else:
             row["error"] = last_msg or "pscp failed"
+        progress_print(
+            ap_index,
+            ap_total,
+            mac,
+            ip,
+            ubicazione,
+            f"upload firmware failed ({row['error']})",
+            progress_enabled and bool(execute),
+        )
         return row
 
     row["upload_ok"] = True
 
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "pre-upgrade file check...", progress_enabled and bool(execute))
     chk_out, chk_err, chk_rc, chk_exc = run_plink(
         plink_path=plink_path,
         host=ip,
@@ -880,6 +1001,7 @@ def process_one_ap(
     if chk_exc:
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = "plink timeout" if chk_exc == "timeout" else chk_exc
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
     if chk_rc != 0:
         combined = ((chk_out or "") + "\n" + (chk_err or "")).lower()
@@ -888,15 +1010,20 @@ def process_one_ap(
         if fw_missing:
             row["status"] = "UPDATE_FAILED_UPLOAD"
             row["error"] = "FWUPDATE_BIN_MISSING"
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         if sys_missing:
             row["status"] = "UPDATE_FAILED_COMMAND"
             row["error"] = "SYSWRAPPER_MISSING"
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = (chk_err or chk_out or "PRE_UPGRADE_CHECK_FAILED").strip()
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "pre-upgrade file check OK", progress_enabled and bool(execute))
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "starting upgrade command", progress_enabled and bool(execute))
     up_out, up_err, up_rc, up_exc = run_plink(
         plink_path=plink_path,
         host=ip,
@@ -911,6 +1038,7 @@ def process_one_ap(
     if up_exc:
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = "plink timeout" if up_exc == "timeout" else up_exc
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
     if up_rc != 0:
         err_type = classify_putty_error(up_out, up_err, up_rc)
@@ -919,13 +1047,17 @@ def process_one_ap(
             row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
             row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
             row["error"] = (up_err or up_out or "plink hostkey mismatch").strip()
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = (up_err or up_out or "upgrade command failed").strip()
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     row["upgrade_started"] = True
     row["status"] = "UPDATE_STARTED"
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "upgrade command started", progress_enabled and bool(execute))
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "waiting for reboot/back online...", progress_enabled and bool(execute))
 
     reboot_detected, back_online, back_error = wait_for_reboot_and_back_online(
         ip=ip,
@@ -935,6 +1067,12 @@ def process_one_ap(
         password=password,
         per_command_timeout=timeout,
         hostkey_fingerprint=hostkey_fingerprint,
+        ap_index=ap_index,
+        ap_total=ap_total,
+        mac=mac,
+        ubicazione=ubicazione,
+        progress_enabled=(progress_enabled and bool(execute)),
+        progress_interval=progress_interval,
     )
     row["reboot_detected"] = reboot_detected
     row["device_back_online"] = back_online
@@ -945,17 +1083,22 @@ def process_one_ap(
             row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
             row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
             row["error"] = "HOSTKEY_MISMATCH_AFTER_REBOOT"
+            progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         row["status"] = "UPDATE_FAILED_DEVICE_NOT_BACK_ONLINE"
         row["error"] = back_error or "DEVICE_NOT_BACK_ONLINE"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "device back online", progress_enabled and bool(execute))
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "post-check...", progress_enabled and bool(execute))
     post, post_err = read_post_info(
         plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
     )
     if post_err:
         row["status"] = "UPDATE_FAILED_POST_CHECK"
         row["error"] = post_err
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
     row["post_firmware_version_short"] = post.get("post_firmware_version_short") or ""
@@ -975,15 +1118,18 @@ def process_one_ap(
     if post_full and post_full == target_full:
         row["post_check_ok"] = True
         row["status"] = "UPDATE_COMPLETED"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"completed {row['status']}", progress_enabled and bool(execute))
         return row
 
     if not post_full and post_short and post_short == target_short:
         row["post_check_ok"] = True
         row["status"] = "UPDATE_COMPLETED_UNVERIFIED_FULL"
+        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"completed {row['status']}", progress_enabled and bool(execute))
         return row
 
     row["status"] = "UPDATE_FAILED_POST_CHECK"
     row["error"] = f"POST_VERSION_MISMATCH full={post_full!r} short={post_short!r}"
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
     return row
 
 
@@ -1014,6 +1160,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--upload-retries", dest="upload_retries", type=int, default=1)
     p.add_argument("--reboot-timeout", type=int, default=300)
     p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--progress", action="store_true", help="Abilita progress live (execute: default ON)")
+    p.add_argument("--no-progress", action="store_true", help="Disabilita progress live (execute)")
+    p.add_argument("--progress-interval", dest="progress_interval", type=int, default=5, help="Intervallo progress (secondi)")
     p.add_argument("--accept-new-hostkeys", action="store_true")
     p.add_argument("--execute", action="store_true")
     args = p.parse_args(argv_list)
@@ -1048,10 +1197,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[PHASE2] Firmware: {os.path.abspath(firmware_path)}")
     print(f"[PHASE2] Target full: {args.target_version_full} | Target short: {args.target_version_short}")
 
+    progress_enabled = False
+    if args.no_progress:
+        progress_enabled = False
+    elif args.progress:
+        progress_enabled = True
+    elif args.execute:
+        progress_enabled = True
+
+    progress_interval = max(1, int(args.progress_interval))
+    if args.execute:
+        print(f"[PHASE2] Progress: {'ON' if progress_enabled else 'OFF'} (interval={progress_interval}s)")
+
     processed: List[Dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         fut_to_rec = {}
-        for rec in records:
+        total = len(records)
+        for idx, rec in enumerate(records, start=1):
             fut = ex.submit(
                 process_one_ap,
                 rec,
@@ -1068,14 +1230,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.reboot_timeout,
                 args.accept_new_hostkeys,
                 args.execute,
+                idx,
+                total,
+                progress_enabled,
+                progress_interval,
             )
-            fut_to_rec[fut] = rec
+            fut_to_rec[fut] = (rec, idx, total)
 
         for fut in as_completed(list(fut_to_rec.keys())):
             try:
                 processed.append(fut.result())
             except Exception as e:
-                rec = fut_to_rec.get(fut) or {}
+                rec, idx, total = fut_to_rec.get(fut) or ({}, 0, 0)
                 row = init_phase2_row(rec)
                 if "action" in rec and (rec.get("action") or "").strip():
                     row["action"] = (rec.get("action") or "").strip()
@@ -1085,6 +1251,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 mac = (row.get("mac") or "").strip()
                 ip = (row.get("ip") or "").strip()
+                ubic = (row.get("ubicazione") or "").strip()
+                progress_print(
+                    int(idx or 0),
+                    int(total or 0),
+                    mac,
+                    ip,
+                    ubic,
+                    f"FAILED ERROR ({row['error']})",
+                    progress_enabled and bool(args.execute),
+                )
                 print(f"[PHASE2][ERROR] Unhandled exception for mac={mac} ip={ip}: {type(e).__name__}: {e}", file=sys.stderr)
                 if args.verbose:
                     print(traceback.format_exc().strip(), file=sys.stderr)

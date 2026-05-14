@@ -261,6 +261,12 @@ Opzioni upload (execute):
 - `--upload-timeout 120` (timeout pscp dedicato, utile su UAP-IW vecchi/slow link)
 - `--upload-retries 1` (numero tentativi upload; >1 abilita retry su timeout/errori transitori)
 
+Opzioni progress (execute):
+- progress live è attivo di default in `--execute`
+- `--no-progress` disabilita l'output live
+- `--progress` forza l'abilitazione (utile se vuoi standardizzare wrapper/scheduler)
+- `--progress-interval 5` controlla l'intervallo (secondi) dei messaggi durante reboot/back-online
+
 ### Host key PuTTY e --accept-new-hostkeys
 
 Per impostazione predefinita gli script non accettano automaticamente nuove host key PuTTY.
