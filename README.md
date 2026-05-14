@@ -257,6 +257,10 @@ python .\uap_iw_phase2_firmware_update.py `
   --execute
 ```
 
+Opzioni upload (execute):
+- `--upload-timeout 120` (timeout pscp dedicato, utile su UAP-IW vecchi/slow link)
+- `--upload-retries 1` (numero tentativi upload; >1 abilita retry su timeout/errori transitori)
+
 ### Host key PuTTY e --accept-new-hostkeys
 
 Per impostazione predefinita gli script non accettano automaticamente nuove host key PuTTY.

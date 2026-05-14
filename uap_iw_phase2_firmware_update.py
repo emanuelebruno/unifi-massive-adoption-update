@@ -15,9 +15,9 @@ from typing import Dict, List, Optional, Tuple
 
 
 SCRIPT_NAME = "uap_iw_phase2_firmware_update.py"
-SCRIPT_VERSION = "0.4.2"
+SCRIPT_VERSION = "0.4.3"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 2 firmware update with fixed remote upgrade command and plink/pscp -hostkey support"
+SCRIPT_SUMMARY = "Phase 2 firmware update with non-blocking ping gate, upload timeout/retries, and plink/pscp -hostkey support"
 
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
@@ -338,7 +338,7 @@ def read_input_report(path: str) -> List[Dict[str, object]]:
 
 
 def ensure_required_fields(records: List[Dict[str, object]]) -> None:
-    required = {"mac", "ubicazione", "ip", "ip_found", "ping_ok", "ssh_ok", "model_family_status"}
+    required = {"mac", "ubicazione", "ip", "ip_found", "ssh_ok", "model_family_status"}
     missing_any = []
     for i, r in enumerate(records):
         missing = [k for k in required if k not in r]
@@ -387,6 +387,7 @@ def init_phase2_row(rec: Dict[str, object]) -> Dict[str, object]:
         "mac": (rec.get("mac") or "").strip(),
         "ubicazione": (rec.get("ubicazione") or "").strip(),
         "ip": (rec.get("ip") or "").strip(),
+        "ping_warning": "",
         "pre_firmware_version_short": (rec.get("firmware_version_short") or rec.get("firmware_version") or "").strip(),
         "pre_firmware_version_full": (rec.get("firmware_version_full") or "").strip(),
         "post_firmware_version_short": "",
@@ -400,6 +401,7 @@ def init_phase2_row(rec: Dict[str, object]) -> Dict[str, object]:
         "hostkey_error_type": "",
         "hostkey_fingerprint": (rec.get("hostkey_fingerprint") or "").strip(),
         "action": "",
+        "upload_attempts": 0,
         "upload_ok": False,
         "upgrade_started": False,
         "reboot_detected": False,
@@ -588,6 +590,7 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "mac",
         "ubicazione",
         "ip",
+        "ping_warning",
         "pre_firmware_version_short",
         "pre_firmware_version_full",
         "post_firmware_version_short",
@@ -601,6 +604,7 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "hostkey_error_type",
         "hostkey_fingerprint",
         "action",
+        "upload_attempts",
         "upload_ok",
         "upgrade_started",
         "reboot_detected",
@@ -632,6 +636,8 @@ def process_one_ap(
     plink_path: str,
     pscp_path: str,
     timeout: int,
+    upload_timeout: int,
+    upload_retries: int,
     reboot_timeout: int,
     accept_new_hostkeys: bool,
     execute: bool,
@@ -647,9 +653,12 @@ def process_one_ap(
         pass
 
     ip_found = coerce_bool(rec.get("ip_found"))
-    ping_ok = coerce_bool(rec.get("ping_ok"))
     ssh_ok = coerce_bool(rec.get("ssh_ok"))
     model_family_status = (rec.get("model_family_status") or "").strip()
+    ping_ok_present = "ping_ok" in rec
+    ping_ok = coerce_bool(rec.get("ping_ok")) if ping_ok_present else True
+    if ping_ok_present and (not ping_ok) and ssh_ok:
+        row["ping_warning"] = "PING_NOT_OK_BUT_SSH_OK"
 
     if not ip_found or not ip:
         row["status"] = "SKIPPED_IP_NOT_FOUND"
@@ -661,11 +670,6 @@ def process_one_ap(
     except Exception:
         row["status"] = "SKIPPED_IP_NOT_FOUND"
         row["error"] = "IP_INVALID"
-        return row
-
-    if not ping_ok:
-        row["status"] = "SKIPPED_SSH_NOT_OK"
-        row["error"] = "PING_NOT_OK"
         return row
 
     if not ssh_ok:
@@ -803,30 +807,61 @@ def process_one_ap(
     row["board_shortname"] = bs
 
     local_fw = os.path.abspath(firmware_path)
-    upload_out, upload_err, upload_rc, upload_exc = run_pscp_upload(
-        pscp_path=pscp_path,
-        host=ip,
-        user=user,
-        password=password,
-        local_file=local_fw,
-        remote_path="/tmp/fwupdate.bin",
-        timeout=max(10, timeout),
-        hostkey_fingerprint=hostkey_fingerprint,
-    )
-    if upload_exc:
+    upload_attempts = 0
+    timed_out_attempts = 0
+    last_err_type = ""
+    last_msg = ""
+    upload_ok = False
+    for attempt in range(1, max(1, int(upload_retries)) + 1):
+        upload_attempts = attempt
+        upload_out, upload_err, upload_rc, upload_exc = run_pscp_upload(
+            pscp_path=pscp_path,
+            host=ip,
+            user=user,
+            password=password,
+            local_file=local_fw,
+            remote_path="/tmp/fwupdate.bin",
+            timeout=max(10, int(upload_timeout)),
+            hostkey_fingerprint=hostkey_fingerprint,
+        )
+
+        if upload_exc:
+            if upload_exc == "timeout":
+                timed_out_attempts += 1
+                last_msg = "timeout"
+            else:
+                last_msg = upload_exc
+            last_err_type = "SSH_TIMEOUT" if upload_exc == "timeout" else "SSH_ERROR"
+        elif upload_rc == 0:
+            upload_ok = True
+            last_err_type = ""
+            last_msg = ""
+            break
+        else:
+            last_err_type = classify_putty_error(upload_out, upload_err, upload_rc)
+            last_msg = (upload_err or upload_out or "pscp failed").strip()
+            if last_err_type == "SSH_HOSTKEY_MISMATCH":
+                row["hostkey_status"] = "HOSTKEY_MISMATCH"
+                row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
+                break
+            if last_err_type == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
+                row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
+                row["hostkey_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
+                break
+            if last_err_type == "SSH_AUTH_FAILED":
+                break
+
+        retryable = (upload_exc == "timeout") or (last_err_type in {"SSH_TIMEOUT", "SSH_UNREACHABLE", "SSH_ERROR"})
+        if not retryable or attempt >= max(1, int(upload_retries)):
+            break
+
+    row["upload_attempts"] = upload_attempts
+    if not upload_ok:
         row["status"] = "UPDATE_FAILED_UPLOAD"
-        row["error"] = "pscp timeout" if upload_exc == "timeout" else upload_exc
-        return row
-    if upload_rc != 0:
-        err_type = classify_putty_error(upload_out, upload_err, upload_rc)
-        if err_type == "SSH_HOSTKEY_MISMATCH":
-            row["hostkey_status"] = "HOSTKEY_MISMATCH"
-            row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
-        if err_type == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
-            row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
-            row["hostkey_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
-        row["status"] = "UPDATE_FAILED_UPLOAD"
-        row["error"] = (upload_err or upload_out or "pscp failed").strip()
+        if timed_out_attempts == upload_attempts and upload_attempts > 0:
+            row["error"] = f"pscp timeout after {upload_attempts} attempt(s)"
+        else:
+            row["error"] = last_msg or "pscp failed"
         return row
 
     row["upload_ok"] = True
@@ -975,6 +1010,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--out", required=True, help="CSV report output")
     p.add_argument("--json", dest="json_out", help="JSON report output (opzionale)")
     p.add_argument("--timeout", type=int, default=10)
+    p.add_argument("--upload-timeout", dest="upload_timeout", type=int, default=120)
+    p.add_argument("--upload-retries", dest="upload_retries", type=int, default=1)
     p.add_argument("--reboot-timeout", type=int, default=300)
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--accept-new-hostkeys", action="store_true")
@@ -1026,6 +1063,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.plink_path,
                 args.pscp_path,
                 args.timeout,
+                args.upload_timeout,
+                args.upload_retries,
                 args.reboot_timeout,
                 args.accept_new_hostkeys,
                 args.execute,
