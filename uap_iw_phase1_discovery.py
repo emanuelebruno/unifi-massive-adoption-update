@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 SCRIPT_NAME = "uap_iw_phase1_discovery.py"
-SCRIPT_VERSION = "0.4.2"
+SCRIPT_VERSION = "0.4.3"
 SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 1 discovery with robust ARP/neighbor discovery, non-blocking ping, and plink -hostkey support"
+SCRIPT_SUMMARY = "Phase 1 discovery with auto-subnet, automatic Ubiquiti discovery, non-blocking ping, and plink -hostkey support"
 
 if __name__ == "__main__" and "--version" in sys.argv[1:]:
     print(f"Script: {SCRIPT_NAME}")
@@ -45,6 +45,17 @@ class APExpected:
     ubicazione: str
 
 
+@dataclass(frozen=True)
+class AutoSubnetSelection:
+    interface_name: str
+    ipv4: str
+    prefix_length: int
+    gateway: str
+    real_subnet: ipaddress.IPv4Network
+    selected_subnet: ipaddress.IPv4Network
+    reduced_large_subnet: bool
+
+
 def normalize_mac(value: str) -> str:
     if value is None:
         raise ValueError("MAC mancante")
@@ -58,6 +69,20 @@ def normalize_mac(value: str) -> str:
 
     s = s.upper()
     return ":".join(s[i : i + 2] for i in range(0, 12, 2))
+
+
+def normalize_oui_prefix(value: str) -> str:
+    if value is None:
+        raise ValueError("OUI prefix mancante")
+    s = re.sub(r"[^0-9A-Fa-f]", "", value.strip())
+    if len(s) != 6 or not re.fullmatch(r"[0-9A-Fa-f]{6}", s):
+        raise ValueError(f"OUI prefix non valido: {value!r}")
+    s = s.upper()
+    return ":".join(s[i : i + 2] for i in range(0, 6, 2))
+
+
+def mac_matches_oui(mac: str, oui_prefix: str) -> bool:
+    return normalize_mac(mac).startswith(normalize_oui_prefix(oui_prefix) + ":")
 
 
 def read_input_csv(path: str) -> List[APExpected]:
@@ -173,6 +198,126 @@ def decode_with_fallback(data: bytes) -> str:
         return str(data)
 
 
+def first_scalar(value: object) -> str:
+    if isinstance(value, list):
+        for item in value:
+            s = first_scalar(item)
+            if s:
+                return s
+        return ""
+    return str(value or "").strip()
+
+
+def detect_windows_ipv4_auto_subnet(allow_large_subnet_scan: bool) -> AutoSubnetSelection:
+    if not platform.system().lower().startswith("win"):
+        raise ValueError("--auto-subnet e' supportato solo su Windows")
+
+    ps_cmd = (
+        "$items = Get-NetIPConfiguration "
+        "| Where-Object { $_.IPv4Address -and $_.NetAdapter.Status -eq 'Up' } "
+        "| ForEach-Object { "
+        "$gw = @($_.IPv4DefaultGateway | ForEach-Object { $_.NextHop })[0]; "
+        "[pscustomobject]@{"
+        "InterfaceAlias=$_.InterfaceAlias;"
+        "InterfaceIndex=$_.InterfaceIndex;"
+        "IPv4Address=$_.IPv4Address.IPAddress;"
+        "PrefixLength=$_.IPv4Address.PrefixLength;"
+        "DefaultGateway=$gw"
+        "} "
+        "} "
+        "| Sort-Object @{Expression={if ($_.DefaultGateway) {0} else {1}}}, InterfaceIndex; "
+        "$items | ConvertTo-Json -Compress"
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+        capture_output=True,
+        check=False,
+        creationflags=(subprocess.CREATE_NO_WINDOW if platform.system().lower().startswith("win") else 0),
+    )
+    out = decode_with_fallback(proc.stdout or b"").strip()
+    err = decode_with_fallback(proc.stderr or b"").strip()
+    if proc.returncode != 0:
+        raise ValueError((err or out or f"Get-NetIPConfiguration failed rc={proc.returncode}").strip())
+    if not out:
+        raise ValueError("Nessuna interfaccia IPv4 attiva rilevata")
+
+    data = json.loads(out)
+    items = data if isinstance(data, list) else [data]
+    candidates: List[Dict[str, object]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        ip = first_scalar(it.get("IPv4Address"))
+        prefix_raw = first_scalar(it.get("PrefixLength"))
+        if not ip or not prefix_raw:
+            continue
+        try:
+            ipaddress.ip_address(ip)
+            prefix_length = int(prefix_raw)
+        except Exception:
+            continue
+        if prefix_length < 0 or prefix_length > 32:
+            continue
+        candidates.append(
+            {
+                "interface": first_scalar(it.get("InterfaceAlias")) or first_scalar(it.get("InterfaceIndex")) or "UNKNOWN",
+                "ip": ip,
+                "prefix": prefix_length,
+                "gateway": first_scalar(it.get("DefaultGateway")),
+            }
+        )
+
+    if not candidates:
+        raise ValueError("Nessuna interfaccia IPv4 attiva valida rilevata")
+
+    selected = candidates[0]
+    ipv4 = str(selected["ip"])
+    prefix_length = int(selected["prefix"])
+    gateway = str(selected["gateway"] or "")
+    real_subnet = ipaddress.ip_network(f"{ipv4}/{prefix_length}", strict=False)
+    reduced = False
+    if prefix_length >= 24 or allow_large_subnet_scan:
+        scan_subnet = real_subnet
+    else:
+        base_ip = gateway or ipv4
+        scan_subnet = ipaddress.ip_network(f"{base_ip}/24", strict=False)
+        reduced = scan_subnet != real_subnet
+
+    return AutoSubnetSelection(
+        interface_name=str(selected["interface"]),
+        ipv4=ipv4,
+        prefix_length=prefix_length,
+        gateway=gateway,
+        real_subnet=real_subnet,
+        selected_subnet=scan_subnet,
+        reduced_large_subnet=reduced,
+    )
+
+
+def select_scan_subnet(args: argparse.Namespace) -> Optional[ipaddress.IPv4Network]:
+    if args.subnet:
+        subnet = ipaddress.ip_network(args.subnet, strict=False)
+        if subnet.version != 4:
+            raise ValueError("solo IPv4 supportato")
+        print(f"[SUBNET] selected scan subnet: {subnet}")
+        return subnet
+
+    if not args.auto_subnet:
+        return None
+
+    selection = detect_windows_ipv4_auto_subnet(args.allow_large_subnet_scan)
+    print(f"[AUTO-SUBNET] detected interface: {selection.interface_name}")
+    print(f"[AUTO-SUBNET] detected IPv4/prefix: {selection.ipv4}/{selection.prefix_length}")
+    print(f"[AUTO-SUBNET] detected gateway: {selection.gateway or '(none)'}")
+    print(f"[AUTO-SUBNET] selected scan subnet: {selection.selected_subnet}")
+    if selection.reduced_large_subnet:
+        print(
+            f"[AUTO-SUBNET][WARN] Detected large subnet {selection.real_subnet}; "
+            f"using {selection.selected_subnet} by default. Pass --allow-large-subnet-scan to scan the real subnet."
+        )
+    return selection.selected_subnet
+
+
 def read_windows_neighbor_table() -> Tuple[Dict[str, str], Optional[str], str]:
     ps_cmd = (
         "Get-NetNeighbor -AddressFamily IPv4 "
@@ -262,6 +407,118 @@ def read_arp_table() -> Tuple[Dict[str, str], Optional[str], Dict[str, object]]:
         return mapping, None, diag
     except Exception as e:
         return {}, str(e), {}
+
+
+def print_arp_verbose(arp_diag: Dict[str, object], arp_map: Dict[str, str], rows: List[Dict[str, object]]) -> None:
+    print("")
+    print(f"[ARP][VERBOSE] ARP righe parse: {int(arp_diag.get('arp_parsed_lines') or 0)}")
+    neighbor_rows = int(arp_diag.get("neighbor_rows") or 0)
+    print(f"[ARP][VERBOSE] Neighbor entries: {neighbor_rows}")
+    neighbor_err = (arp_diag.get("neighbor_error") or "").strip()
+    if neighbor_err:
+        print(f"[ARP][VERBOSE] Neighbor error: {neighbor_err}")
+
+    lines = arp_diag.get("arp_matched_lines") or []
+    if lines:
+        print("[ARP][VERBOSE] arp -a matched lines:")
+        for ln in lines:
+            print(ln)
+    else:
+        raw = (arp_diag.get("arp_raw") or "").strip()
+        if raw:
+            print("[ARP][VERBOSE] arp -a raw output:")
+            print(raw)
+
+    print("[ARP][VERBOSE] MAC->IP mapping:")
+    for mac in sorted(arp_map.keys()):
+        print(f"{mac} -> {arp_map[mac]}")
+
+    if rows:
+        print("[ARP][VERBOSE] CSV MAC lookup:")
+        for r in rows:
+            mac = r.get("mac") or ""
+            ip = arp_map.get(mac, "")
+            if ip:
+                print(f"FOUND {mac} -> {ip}")
+            else:
+                print(f"NOT FOUND {mac}")
+    print("")
+
+
+def apply_arp_ips_to_rows(rows: List[Dict[str, object]], arp_map: Dict[str, str]) -> None:
+    for r in rows:
+        mac = r.get("mac") or ""
+        ip = arp_map.get(mac, "")
+        if ip:
+            r["ip"] = ip
+            r["ip_found"] = True
+            r["status"] = "IP_FOUND"
+
+
+def discover_ubiquiti_aps(
+    subnet: Optional[ipaddress.IPv4Network],
+    arp_only: bool,
+    oui_prefix: str,
+    workers: int,
+    ping_timeout_ms: int,
+    verbose_arp: bool,
+    existing_rows: List[Dict[str, object]],
+) -> Tuple[List[APExpected], Dict[str, str]]:
+    normalized_oui = normalize_oui_prefix(oui_prefix)
+    if arp_only:
+        print("[DISCOVERY] Modalita' ARP-only: nessun ping sweep")
+    else:
+        if subnet is None:
+            raise ValueError("--discover-ubiquiti richiede --subnet oppure --auto-subnet, salvo uso di --arp-only")
+        print(f"[DISCOVERY] Ping sweep subnet {subnet}...")
+        ok_count = ping_sweep(subnet, workers=workers, timeout_ms=ping_timeout_ms)
+        print(f"[DISCOVERY] Ping sweep completato: {ok_count} host rispondono")
+
+    arp_map, arp_err, arp_diag = read_arp_table()
+    if arp_err:
+        print(f"[ARP] Errore lettura tabella ARP/neighbor: {arp_err}")
+    print(f"[ARP] Trovati {len(arp_map)} dispositivi nella tabella ARP/neighbor")
+
+    if verbose_arp:
+        print_arp_verbose(arp_diag, arp_map, existing_rows)
+
+    discovered: List[APExpected] = []
+    discovered_ip_by_mac: Dict[str, str] = {}
+    for mac in sorted(arp_map.keys()):
+        try:
+            if not mac_matches_oui(mac, normalized_oui):
+                continue
+        except ValueError:
+            continue
+        ip = arp_map.get(mac, "")
+        discovered.append(APExpected(mac=mac, ubicazione=f"DISCOVERED_{ip}"))
+        discovered_ip_by_mac[mac] = ip
+
+    print(f"[DISCOVERY] OUI prefix: {normalized_oui}")
+    print(f"[DISCOVERY] Ubiquiti AP scoperti: {len(discovered)}")
+    return discovered, discovered_ip_by_mac
+
+
+def merge_csv_and_discovered_aps(
+    csv_aps: List[APExpected],
+    discovered_aps: List[APExpected],
+    discovered_ip_by_mac: Dict[str, str],
+) -> List[Dict[str, object]]:
+    merged: Dict[str, APExpected] = {}
+    for ap in discovered_aps:
+        merged[ap.mac] = ap
+    for ap in csv_aps:
+        merged[ap.mac] = ap
+
+    rows = build_initial_rows(list(merged.values()))
+    for row in rows:
+        mac = row.get("mac") or ""
+        ip = discovered_ip_by_mac.get(mac, "")
+        if ip:
+            row["ip"] = ip
+            row["ip_found"] = True
+            row["status"] = "IP_FOUND"
+    return rows
 
 
 def ssh_run_command(
@@ -1138,8 +1395,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p = argparse.ArgumentParser(description="UAP-IW / U2IW Phase 1 discovery (read-only).")
     p.add_argument("--version", action="store_true", help="Stampa versione script ed esce")
-    p.add_argument("--input", required=True, help="CSV input (mac, ubicazione)")
+    p.add_argument("--input", help="CSV input (mac, ubicazione)")
     p.add_argument("--subnet", help="Subnet CIDR (es. 192.168.1.0/24)")
+    p.add_argument("--auto-subnet", dest="auto_subnet", action="store_true", help="Rileva automaticamente la subnet IPv4 Windows")
+    p.add_argument(
+        "--allow-large-subnet-scan",
+        dest="allow_large_subnet_scan",
+        action="store_true",
+        help="Permette ad --auto-subnet di scansionare subnet larghe reali (/16, /20, ecc.)",
+    )
+    p.add_argument(
+        "--discover-ubiquiti",
+        dest="discover_ubiquiti",
+        action="store_true",
+        help="Scopre automaticamente AP Ubiquiti da ARP/Neighbor filtrando per OUI",
+    )
+    p.add_argument("--oui-prefix", dest="oui_prefix", default="80:2A:A8", help="OUI prefix Ubiquiti da filtrare (default: 80:2A:A8)")
     p.add_argument("--single-ip", dest="single_ip", help="Test singolo IP (bypass ARP discovery)")
     p.add_argument("--arp-only", dest="arp_only", action="store_true", help="Modalità ARP-only: niente ping sweep subnet")
     p.add_argument("--verbose-arp", dest="verbose_arp", action="store_true", help="Stampa diagnostica ARP/neighbor")
@@ -1178,7 +1449,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.accept_new_hostkeys:
         print("[INFO] --accept-new-hostkeys enabled: plink will retry with -hostkey (fingerprint extracted from output; no PuTTY cache write).")
 
-    aps = read_input_csv(args.input)
+    if not args.input and not args.discover_ubiquiti and not args.single_ip:
+        print("Errore: specificare --input oppure usare --discover-ubiquiti o --single-ip", file=sys.stderr)
+        return 2
+
+    try:
+        normalize_oui_prefix(args.oui_prefix)
+    except ValueError as e:
+        print(f"Errore: {e}", file=sys.stderr)
+        return 2
+
+    aps: List[APExpected] = []
+    if args.input:
+        aps = read_input_csv(args.input)
     rows = build_initial_rows(aps)
 
     if args.single_ip:
@@ -1219,6 +1502,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 }
             ]
         print(f"[SCAN] Test singolo IP {ip} (bypass subnet/ARP)")
+    elif args.discover_ubiquiti:
+        try:
+            subnet = None if args.arp_only else select_scan_subnet(args)
+            discovered_aps, discovered_ip_by_mac = discover_ubiquiti_aps(
+                subnet=subnet,
+                arp_only=args.arp_only,
+                oui_prefix=args.oui_prefix,
+                workers=args.workers,
+                ping_timeout_ms=args.ping_timeout_ms,
+                verbose_arp=args.verbose_arp,
+                existing_rows=rows,
+            )
+        except ValueError as e:
+            print(f"Errore: {e}", file=sys.stderr)
+            return 2
+        rows = merge_csv_and_discovered_aps(aps, discovered_aps, discovered_ip_by_mac)
     elif args.arp_only:
         print("[SCAN] Modalità ARP-only: nessun ping sweep")
 
@@ -1269,13 +1568,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 r["ip_found"] = True
                 r["status"] = "IP_FOUND"
     else:
-        if not args.subnet:
-            print("Errore: specificare --subnet oppure --single-ip oppure --arp-only", file=sys.stderr)
+        try:
+            subnet = select_scan_subnet(args)
+        except ValueError as e:
+            print(f"Errore: {e}", file=sys.stderr)
             return 2
-
-        subnet = ipaddress.ip_network(args.subnet, strict=False)
-        if subnet.version != 4:
-            print("Errore: solo IPv4 supportato", file=sys.stderr)
+        if subnet is None:
+            print("Errore: specificare --subnet oppure --auto-subnet oppure --single-ip oppure --arp-only", file=sys.stderr)
             return 2
 
         print(f"[SCAN] Scansione subnet {subnet}...")
@@ -1328,6 +1627,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 r["ip"] = ip
                 r["ip_found"] = True
                 r["status"] = "IP_FOUND"
+
+    if not rows:
+        print("Errore: nessun AP da processare (CSV assente/vuoto e discovery senza risultati)", file=sys.stderr)
+        return 2
 
     print(f"[AP] Elaborazione AP (workers={max(1, args.workers)})...")
     processed: List[Dict[str, object]] = []

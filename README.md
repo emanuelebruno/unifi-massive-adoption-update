@@ -73,8 +73,10 @@ uap-iw-tools/
 
 ```powershell
 python -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+setup_windows.ps1
 ```
 
 ### Setup Windows rapido da repository pubblico
