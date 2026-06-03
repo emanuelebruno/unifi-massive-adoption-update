@@ -9,6 +9,7 @@ Thumbs.db
 # Real input and output data
 aps.csv
 reports/*
+tools/
 !reports/.gitkeep
 
 # Firmware files should not be committed
