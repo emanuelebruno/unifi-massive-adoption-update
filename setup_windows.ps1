@@ -1,9 +1,10 @@
 param(
-    [switch]$Version
+    [switch]$Version,
+    [switch]$FunctionsOnly
 )
 
 $ScriptName = "setup_windows.ps1"
-$ScriptVersion = "0.5.0"
+$ScriptVersion = "0.5.1"
 $ScriptBuildDate = "2026-08-27"
 $ScriptSummary = "Windows bootstrap with compatibility catalog provisioning, Python fallback and local PuTTY tools"
 
@@ -141,10 +142,34 @@ function Try-Install-WithWinget {
 
 function Resolve-PythonCommand {
     $py = Get-CommandPathOrNull -CommandName 'py'
-    if ($py) { return 'py' }
+    if ($py -and (Test-PythonLauncher -Launcher 'py')) { return 'py' }
     $python = Get-CommandPathOrNull -CommandName 'python'
-    if ($python) { return 'python' }
+    if ($python -and (Test-PythonLauncher -Launcher 'python')) { return 'python' }
     return $null
+}
+
+function Test-PythonLauncher {
+    param([Parameter(Mandatory = $true)][string]$Launcher)
+
+    $sentinel = '__UNIFI_PYTHON_OK__'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $captured = @(& $Launcher -c "print('$sentinel')" 2>&1)
+        $exitCode = $LASTEXITCODE
+        $sentinelFound = $false
+        foreach ($line in $captured) {
+            if (([string]$line).Trim() -eq $sentinel) {
+                $sentinelFound = $true
+                break
+            }
+        }
+        return [bool](($exitCode -eq 0) -and $sentinelFound)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 }
 
 function Add-ToSessionPath([string]$Dir) {
@@ -290,6 +315,9 @@ function Assert-ValidPythonLauncher([string]$PythonLauncher) {
     if ($trimmed -ieq 'python' -or $trimmed -ieq 'py') {
         $cmd = Get-Command $trimmed -ErrorAction SilentlyContinue
         if (-not $cmd) { throw "Comando $trimmed non trovato in PATH." }
+        if (-not (Test-PythonLauncher -Launcher $trimmed)) {
+            throw "Python launcher trovato ma non eseguibile come interprete Python: $trimmed"
+        }
         return
     }
 
@@ -298,6 +326,112 @@ function Assert-ValidPythonLauncher([string]$PythonLauncher) {
     }
     if ($trimmed -notmatch '(?i)\.exe$') {
         throw "PythonLauncher non valido (non è un .exe): $trimmed"
+    }
+    if (-not (Test-PythonLauncher -Launcher $trimmed)) {
+        throw "Python launcher esistente ma non eseguibile come interprete Python: $trimmed"
+    }
+}
+
+function Get-VenvState {
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+    $projectRootFull = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $venvPath = Join-Path $projectRootFull '.venv'
+    $venvPython = Join-Path $venvPath 'Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $venvPath)) {
+        return 'ABSENT'
+    }
+    if (-not (Test-Path -LiteralPath $venvPath -PathType Container)) {
+        return 'BROKEN'
+    }
+    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+        return 'BROKEN'
+    }
+    if (-not (Test-PythonLauncher -Launcher $venvPython)) {
+        return 'BROKEN'
+    }
+    return 'VALID'
+}
+
+function Assert-SafeRepositoryVenvPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][string]$VenvPath
+    )
+
+    $projectRootFull = [System.IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\')
+    $venvFull = [System.IO.Path]::GetFullPath($VenvPath).TrimEnd('\')
+    $expected = (Join-Path $projectRootFull '.venv').TrimEnd('\')
+    if (-not $venvFull.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Rifiuto rimozione venv fuori dal target esatto del progetto: $venvFull"
+    }
+    $venvItem = [System.IO.DirectoryInfo]$venvFull
+    if ($venvItem.Name -ne '.venv' -or -not $venvItem.Parent.FullName.TrimEnd('\').Equals($projectRootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Rifiuto rimozione target venv non sicuro: $venvFull"
+    }
+}
+
+function Initialize-PythonEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][string]$PythonLauncher,
+        [Parameter(Mandatory = $true)][bool]$UsingPythonEmbed
+    )
+
+    Assert-ValidPythonLauncher -PythonLauncher $PythonLauncher
+    $projectRootFull = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $venvPath = Join-Path $projectRootFull '.venv'
+    $venvPython = Join-Path $venvPath 'Scripts\python.exe'
+    $initialState = Get-VenvState -ProjectRoot $projectRootFull
+
+    if ($UsingPythonEmbed) {
+        if ($initialState -eq 'BROKEN') {
+            Write-Host 'WARNING: .venv stale/incompleta ignorata; uso Python embeddable senza venv.'
+        } else {
+            Write-Host 'WARNING: uso Python embeddable: proseguo senza venv.'
+        }
+        return [PSCustomObject]@{
+            PythonForInstall = $PythonLauncher
+            UseVenv = $false
+            InitialVenvState = $initialState
+            FinalVenvState = $initialState
+            Rebuilt = $false
+        }
+    }
+
+    $rebuilt = $false
+    if ($initialState -eq 'VALID') {
+        Write-Host 'OK: .venv già presente e valida'
+    } else {
+        if ($initialState -eq 'BROKEN') {
+            Write-Host 'WARNING: .venv stale/incompleta; ricreazione sicura in corso.'
+            Assert-SafeRepositoryVenvPath -ProjectRoot $projectRootFull -VenvPath $venvPath
+            Remove-Item -LiteralPath $venvPath -Recurse -Force
+            $rebuilt = $true
+        }
+        Push-Location -LiteralPath $projectRootFull
+        try {
+            & $PythonLauncher -m venv .venv | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw "Creazione venv fallita (exit code: $LASTEXITCODE)."
+            }
+        } finally {
+            Pop-Location
+        }
+        if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+            throw "Creazione venv fallita: python.exe non trovato in $venvPython"
+        }
+        if (-not (Test-PythonLauncher -Launcher $venvPython)) {
+            throw "Creazione venv fallita: il nuovo interprete non è eseguibile: $venvPython"
+        }
+    }
+
+    return [PSCustomObject]@{
+        PythonForInstall = $venvPython
+        UseVenv = $true
+        InitialVenvState = $initialState
+        FinalVenvState = 'VALID'
+        Rebuilt = $rebuilt
     }
 }
 
@@ -453,6 +587,10 @@ function Quote-Arg([string]$Value) {
     return $Value
 }
 
+if ($FunctionsOnly) {
+    return
+}
+
 Write-Section 'Setup UAP-IW Tools (Windows)'
 Write-Host ('Cartella corrente: ' + (Get-Location).Path)
 
@@ -520,28 +658,14 @@ Write-Host ('plink: ' + $script:PlinkPath)
 Write-Host ('pscp:  ' + $script:PscpPath)
 
 Write-Section 'Virtualenv (.venv)'
-$venvPython = '.\.venv\Scripts\python.exe'
-$useVenv = $true
-if (Test-Path -LiteralPath $venvPython) {
-    Write-Host 'OK: .venv già presente'
-} else {
-    if (Test-Path -LiteralPath '.\.venv') {
-        throw 'La cartella .venv esiste ma .venv\Scripts\python.exe non è presente. Elimina .venv e riesegui.'
-    }
-    if ($script:UsingPythonEmbed) {
-        $useVenv = $false
-        Write-Host 'WARNING: uso Python embeddable: proseguo senza venv.'
-    } else {
-        & $pythonLauncher -m venv .venv | Out-Host
-        if (-not (Test-Path -LiteralPath $venvPython)) {
-            throw 'Creazione venv fallita: .venv\Scripts\python.exe non trovato.'
-        }
-    }
-}
+$pythonEnvironment = Initialize-PythonEnvironment `
+    -ProjectRoot (Get-Location).Path `
+    -PythonLauncher $pythonLauncher `
+    -UsingPythonEmbed ([bool]$script:UsingPythonEmbed)
+$useVenv = [bool]$pythonEnvironment.UseVenv
+$pythonForInstall = [string]$pythonEnvironment.PythonForInstall
 
 Write-Section 'Install requirements'
-$pythonForInstall = $venvPython
-if (-not $useVenv) { $pythonForInstall = $pythonLauncher }
 & $pythonForInstall -m pip install -r .\requirements.txt | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "pip install fallito (exit code: $LASTEXITCODE)."
@@ -566,8 +690,8 @@ Write-Section 'Comandi pronti (NON eseguiti automaticamente)'
 $plinkForPrint = Quote-Arg $script:PlinkPath
 $pscpForPrint = Quote-Arg $script:PscpPath
 $pythonForPrint = '.\.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $pythonForPrint)) {
-    $pythonForPrint = '.\tools\python-embed\python.exe'
+if (-not $useVenv) {
+    $pythonForPrint = $pythonLauncher
 }
 
 @"
