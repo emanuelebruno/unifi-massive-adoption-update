@@ -3,9 +3,9 @@ param(
 )
 
 $ScriptName = "setup_windows.ps1"
-$ScriptVersion = "0.4.0"
-$ScriptBuildDate = "2026-05-13"
-$ScriptSummary = "Windows bootstrap with GitHub download, Python embeddable fallback and local PuTTY tools"
+$ScriptVersion = "0.5.0"
+$ScriptBuildDate = "2026-08-27"
+$ScriptSummary = "Windows bootstrap with compatibility catalog provisioning, Python fallback and local PuTTY tools"
 
 Write-Host "Setup UAP-IW Tools (Windows)"
 Write-Host ("Version: {0}" -f $ScriptVersion)
@@ -456,9 +456,13 @@ function Quote-Arg([string]$Value) {
 Write-Section 'Setup UAP-IW Tools (Windows)'
 Write-Host ('Cartella corrente: ' + (Get-Location).Path)
 
+Ensure-Directory -Path '.\compatibility'
+
 $requiredFiles = @(
     'uap_iw_phase1_discovery.py',
     'uap_iw_phase2_firmware_update.py',
+    'unifi_firmware_compatibility.py',
+    'compatibility/ubiquiti_unifi_firmware.json',
     'requirements.txt'
 )
 
@@ -546,6 +550,11 @@ if ($LASTEXITCODE -ne 0) {
 Write-Section 'py_compile'
 & $pythonForInstall -m py_compile .\uap_iw_phase1_discovery.py | Out-Host
 & $pythonForInstall -m py_compile .\uap_iw_phase2_firmware_update.py | Out-Host
+& $pythonForInstall -m py_compile .\unifi_firmware_compatibility.py | Out-Host
+& $pythonForInstall -c "import os, sys; sys.path.insert(0, os.getcwd()); import unifi_firmware_compatibility as c; print('OK: compatibility catalog ' + c.validate_default_catalog())" | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Validazione modulo/catalogo compatibilita fallita (exit code: $LASTEXITCODE)."
+}
 
 Write-Section 'Verifica finale firmware'
 if (-not (Test-Path -LiteralPath $firmwareLocal)) {

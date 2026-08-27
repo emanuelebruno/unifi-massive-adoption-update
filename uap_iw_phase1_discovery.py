@@ -1,5 +1,7 @@
 import argparse
+import base64
 import csv
+import hashlib
 import ipaddress
 import json
 import logging
@@ -14,10 +16,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIRECTORY not in sys.path:
+    sys.path.insert(0, SCRIPT_DIRECTORY)
+
+from unifi_firmware_compatibility import CompatibilityError, CompatibilityResolutionError, identify_device_profile, load_catalog
+
 SCRIPT_NAME = "uap_iw_phase1_discovery.py"
-SCRIPT_VERSION = "0.4.3"
-SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 1 discovery with auto-subnet, automatic Ubiquiti discovery, non-blocking ping, and plink -hostkey support"
+SCRIPT_VERSION = "0.5.0"
+SCRIPT_BUILD_DATE = "2026-08-27"
+SCRIPT_SUMMARY = "Phase 1 discovery with catalog-assisted identification and Paramiko/Plink host-key fingerprints"
 
 if __name__ == "__main__" and "--version" in sys.argv[1:]:
     print(f"Script: {SCRIPT_NAME}")
@@ -664,6 +672,39 @@ def evaluate_model_family(board_name: str, board_shortname: str, device_model: s
     return "MODEL_FAMILY_UNKNOWN"
 
 
+def identify_catalog_device(evidence: Dict[str, object]) -> Dict[str, str]:
+    result = {
+        "device_profile_id": "",
+        "device_identification_status": "DEVICE_PROFILE_NOT_IDENTIFIED",
+        "firmware_update_support_status": "NOT_CATALOG_SUPPORTED",
+        "compatibility_error": "",
+    }
+    try:
+        profile = identify_device_profile(evidence, load_catalog())
+    except CompatibilityResolutionError as exc:
+        result["device_identification_status"] = exc.code
+        return result
+    except CompatibilityError as exc:
+        result["device_identification_status"] = "COMPATIBILITY_CATALOG_INVALID"
+        result["compatibility_error"] = str(exc)
+        return result
+    result["device_profile_id"] = str(profile["id"])
+    result["device_identification_status"] = "DEVICE_PROFILE_IDENTIFIED"
+    result["firmware_update_support_status"] = "TRANSITION_DEPENDENT"
+    return result
+
+
+def paramiko_server_fingerprint(client: paramiko.SSHClient) -> str:
+    transport = client.get_transport()
+    if transport is None:
+        return ""
+    key = transport.get_remote_server_key()
+    if key is None:
+        return ""
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 def ssh_error_type_from_paramiko_exception(e: Exception) -> str:
     msg = str(e or "").lower()
     if "incompatible ssh peer" in msg or "no acceptable host key" in msg or "no matching host key type found" in msg:
@@ -832,7 +873,7 @@ def paramiko_collect_device_info(host: str, user: str, password: str, timeout: i
         "ssh_ok": False,
         "ssh_backend": "paramiko",
         "ssh_error_type": "",
-        "hostkey_status": "HOSTKEY_NOT_APPLICABLE",
+        "hostkey_status": "HOSTKEY_NOT_CHECKED",
         "hostkey_auto_accepted": False,
         "hostkey_error_type": "",
         "hostkey_fingerprint": "",
@@ -846,6 +887,10 @@ def paramiko_collect_device_info(host: str, user: str, password: str, timeout: i
         "board_hwaddr": "",
         "device_model": "",
         "model_family_status": "MODEL_FAMILY_UNKNOWN",
+        "device_profile_id": "",
+        "device_identification_status": "DEVICE_PROFILE_NOT_IDENTIFIED",
+        "firmware_update_support_status": "NOT_CATALOG_SUPPORTED",
+        "compatibility_error": "",
         "error": "",
     }
 
@@ -864,6 +909,13 @@ def paramiko_collect_device_info(host: str, user: str, password: str, timeout: i
             allow_agent=False,
         )
         result["ssh_ok"] = True
+        fingerprint = paramiko_server_fingerprint(client)
+        if fingerprint:
+            result["hostkey_fingerprint"] = fingerprint
+            result["hostkey_status"] = "HOSTKEY_OBSERVED_PARAMIKO"
+        else:
+            result["hostkey_status"] = "HOSTKEY_FINGERPRINT_UNAVAILABLE"
+            result["hostkey_error_type"] = "SSH_HOSTKEY_FINGERPRINT_UNAVAILABLE"
 
         v_out, v_err, v_code, v_exc = ssh_run_command(client, "cat /etc/version", timeout)
         if v_exc:
@@ -901,6 +953,7 @@ def paramiko_collect_device_info(host: str, user: str, password: str, timeout: i
             result.get("device_model") or "",
         )
         result["firmware_family_ok"] = result["model_family_status"] == "MODEL_FAMILY_OK"
+        result.update(identify_catalog_device(result))
         return result
     except Exception as e:
         result["ssh_ok"] = False
@@ -1187,6 +1240,10 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "board_hwaddr",
         "device_model",
         "model_family_status",
+        "device_profile_id",
+        "device_identification_status",
+        "firmware_update_support_status",
+        "compatibility_error",
         "status",
         "error",
     ]
@@ -1236,6 +1293,10 @@ def build_initial_rows(aps: List[APExpected]) -> List[Dict[str, object]]:
                 "board_shortname": "",
                 "board_hwaddr": "",
                 "model_family_status": "MODEL_FAMILY_UNKNOWN",
+                "device_profile_id": "",
+                "device_identification_status": "DEVICE_PROFILE_NOT_IDENTIFIED",
+                "firmware_update_support_status": "NOT_CATALOG_SUPPORTED",
+                "compatibility_error": "",
                 "status": "IP_NOT_FOUND",
                 "error": "",
             }
@@ -1301,6 +1362,8 @@ def process_one_ap(
     row["board_shortname"] = info.get("board_shortname") or ""
     row["board_hwaddr"] = info.get("board_hwaddr") or ""
     row["model_family_status"] = info.get("model_family_status") or "MODEL_FAMILY_UNKNOWN"
+    catalog_identity = identify_catalog_device(row)
+    row.update(catalog_identity)
 
     err = info.get("error") or ""
     if err:
@@ -1321,6 +1384,13 @@ def process_one_ap(
         row["status"] = "FIRMWARE_READ_FAILED"
         if not row["error"]:
             row["error"] = "Firmware version empty"
+        return row
+
+    if row.get("device_identification_status") == "DEVICE_PROFILE_IDENTIFIED":
+        if not row.get("ping_ok"):
+            row["ping_warning"] = "PING_FAILED_BUT_SSH_OK"
+        row["error"] = ""
+        row["status"] = "IP_FOUND_SSH_OK_IDENTIFIED"
         return row
 
     if row.get("model_family_status") == "MODEL_FAMILY_MISMATCH":

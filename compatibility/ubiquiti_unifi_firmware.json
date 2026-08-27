@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "vendor": "ubiquiti",
+  "product_family": "unifi",
+  "device_profiles": [
+    {
+      "id": "ubiquiti-unifi-u6plus-uapl6",
+      "vendor": "ubiquiti",
+      "product_family": "unifi",
+      "commercial_model": "U6+",
+      "identity": {
+        "device_model": "U6+",
+        "board_name": "U6+",
+        "board_shortname": "UAPL6"
+      },
+      "required_identity_fields": [
+        "device_model",
+        "board_name",
+        "board_shortname"
+      ],
+      "hardware_revision": null,
+      "firmware_platform": "BZ.MT7981"
+    }
+  ],
+  "firmware_artifacts": [
+    {
+      "id": "ubiquiti-unifi-u6plus-6.7.54.15663",
+      "vendor": "ubiquiti",
+      "firmware_platform": "BZ.MT7981",
+      "version_short": "BZ.6.7.54",
+      "version_full": "6.7.54.15663",
+      "build": "15663",
+      "filename": "BZ.MT7981_6.7.54+15663.260513.1738.bin",
+      "size": 13253291,
+      "sha256": "7211a694fa8c23998a551b99dc073e729b3067d94295de6728f7019178b7d560",
+      "source": {
+        "kind": "official-vendor",
+        "note": "Ubiquiti-supported U6+ firmware 6.7.54"
+      }
+    }
+  ],
+  "transition_rules": [
+    {
+      "id": "u6plus-uapl6-6.5.64.14808-to-6.7.54.15663",
+      "device_profile_id": "ubiquiti-unifi-u6plus-uapl6",
+      "allowed_sources": [
+        {
+          "version_short": "BZ.6.5.64",
+          "version_full": "6.5.64.14808"
+        }
+      ],
+      "target_artifact_id": "ubiquiti-unifi-u6plus-6.7.54.15663",
+      "operation": "ssh_syswrapper_upgrade2",
+      "support_status": "approved",
+      "constraints": {
+        "require_exact_source_short_and_full": true,
+        "require_exact_target_short_and_full": true,
+        "require_report_hostkey_sha256": true,
+        "require_live_identity_recheck": true,
+        "require_live_source_recheck": true,
+        "require_post_identity_recheck": true,
+        "require_post_target_recheck": true
+      }
+    }
+  ]
+}

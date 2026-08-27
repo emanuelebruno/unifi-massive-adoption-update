@@ -20,11 +20,12 @@ Un dispositivo rilevato o identificato non è automaticamente supportato o autor
 Supporto operativo corrente:
 
 - discovery/inventario: workflow UniFi in sola lettura;
-- modifica firmware: soltanto UAP-IW / U2IW con tutti i gate esistenti;
+- modifica firmware UAP-IW / U2IW: percorso legacy con tutti i gate esistenti;
+- modifica firmware U6+: soltanto la transizione dichiarativa esatta UAPL6 da `6.5.64.14808` a `6.7.54.15663`;
 - set-inform: soltanto UAP-IW / U2IW con tutti i gate esistenti;
-- U6+ / `UAPL6`: rilevato e identificato, ma non ancora modification-eligible.
+- U6+ resta sempre escluso dalla Fase 3/set-inform.
 
-Il firmware MT7981 presente nel repository non autorizza l'aggiornamento di U6+. Il supporto funzionale richiede una patch separata con compatibilità esatta e test di sicurezza.
+Il firmware MT7981 presente nel repository non autorizza da solo l'aggiornamento. La modifica richiede il match univoco di profilo, sorgente, transizione e artifact, SHA256 corretto, host key valida e preflight live coerente.
 
 ## Funzionalità implementate
 
@@ -45,7 +46,7 @@ La Fase 1 non carica firmware, non riavvia, non esegue set-inform e non modifica
 
 `uap_iw_phase2_firmware_update.py` è implementato, gated e dry-run per default.
 
-Senza `--execute` valida report, modello, versione, firmware e fingerprint senza caricare firmware o avviare upgrade. In execute mode mantiene gli attuali gate UAP-IW/U2IW, usa `plink`/`pscp` con fingerprint esplicita e verifica il dispositivo dopo il riavvio.
+Senza `--execute` valida report, modello, versione, firmware e fingerprint senza rete, upload o upgrade. UAP-IW/U2IW mantengono il percorso legacy; U6+ è il primo profilo dichiarativo. In execute mode usa `plink`/`pscp` con fingerprint esplicita, ripete live l'identità e la versione sorgente prima dell'upload e verifica identità/versione dopo il riavvio.
 
 ### Fase 3 — Set-inform
 
@@ -60,6 +61,7 @@ I nomi `uap_iw_*` descrivono gli entry point operativi correnti. La loro rinomin
 ```text
 unifi-massive-adoption-update/
 ├── .trae/rules/                 # regole TRAE storiche, non normative
+├── compatibility/               # profili/artifact/transizioni dichiarativi
 ├── docs/archive/                # documenti storici
 ├── downloads/                   # download/cache correnti
 ├── firmware/                    # firmware locali correnti
@@ -70,6 +72,7 @@ unifi-massive-adoption-update/
 ├── aps.example.csv
 ├── requirements.txt
 ├── setup_windows.ps1
+├── unifi_firmware_compatibility.py
 ├── uap_iw_phase1_discovery.py
 ├── uap_iw_phase2_firmware_update.py
 └── uap_iw_phase3_set_inform.py
@@ -167,7 +170,46 @@ python .\uap_iw_phase2_firmware_update.py `
   --json .\reports\phase2_update_report.json
 ```
 
-`--execute` abilita operazioni modificanti soltanto dopo tutti i gate. Per attività sul campo è consigliato `--workers 1`. Non usare il comando UAP-IW/U2IW per U6+ o altri modelli.
+`--execute` abilita operazioni modificanti soltanto dopo tutti i gate. Per attività sul campo è consigliato `--workers 1`.
+
+### U6+ — transizione dichiarativa approvata
+
+```text
+DEVICE PROFILE != FIRMWARE ARTIFACT != TRANSITION RULE
+```
+
+Il modello commerciale da solo non è prova sufficiente: board, hardware e revisione possono richiedere artifact differenti. Evidenza mancante, contraddittoria o ambigua blocca l'operazione.
+
+Transizione attualmente dichiarata:
+
+```text
+device_model       U6+
+board_name         U6+
+board_shortname    UAPL6
+source             BZ.6.5.64 / 6.5.64.14808
+target             BZ.6.7.54 / 6.7.54.15663
+filename           BZ.MT7981_6.7.54+15663.260513.1738.bin
+size               13253291
+SHA256             7211A694FA8C23998A551B99DC073E729B3067D94295DE6728F7019178B7D560
+```
+
+Dry-run offline:
+
+```powershell
+python .\uap_iw_phase2_firmware_update.py `
+  --input .\reports\u6plus_phase1.json `
+  --firmware .\firmware\BZ.MT7981_6.7.54+15663.260513.1738.bin `
+  --target-version-full 6.7.54.15663 `
+  --target-version-short BZ.6.7.54 `
+  --user ubnt --password ubnt `
+  --plink-path plink.exe --pscp-path pscp.exe `
+  --out .\reports\u6plus_phase2_dryrun.csv `
+  --json .\reports\u6plus_phase2_dryrun.json
+```
+
+Il dry-run calcola SHA256 ma non usa Plink/PSCP. L'execute, quando richiesto esplicitamente, verifica con host key pinning `/etc/board.info`, `/etc/version` e `mca-cli-op info` prima di qualsiasi upload. Differenze tra report e stato live bloccano l'operazione.
+
+UAP-IW/U2IW restano temporaneamente sul percorso compatibilità legacy per contenere il rischio di regressione. È una soluzione transitoria: una futura patch approvata potrà migrarli nel catalogo. Nuove versioni per hardware già compreso dovrebbero normalmente richiedere modifiche ai dati del catalogo, non al codice operativo; il codice cambia per nuovi protocolli, identificazione, meccanismi di upgrade o validazioni.
 
 ## Esecuzione Fase 3
 

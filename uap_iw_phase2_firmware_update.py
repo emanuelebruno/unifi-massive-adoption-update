@@ -14,11 +14,24 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
+SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIRECTORY not in sys.path:
+    sys.path.insert(0, SCRIPT_DIRECTORY)
+
+from unifi_firmware_compatibility import (
+    CompatibilityError,
+    CompatibilityResolutionError,
+    identify_device_profile,
+    load_catalog,
+    resolve_transition,
+    verify_artifact,
+)
+
 
 SCRIPT_NAME = "uap_iw_phase2_firmware_update.py"
-SCRIPT_VERSION = "0.4.4"
-SCRIPT_BUILD_DATE = "2026-05-13"
-SCRIPT_SUMMARY = "Phase 2 firmware update with live progress, non-blocking ping gate, upload timeout/retries, and plink/pscp -hostkey support"
+SCRIPT_VERSION = "0.5.0"
+SCRIPT_BUILD_DATE = "2026-08-27"
+SCRIPT_SUMMARY = "Phase 2 gated firmware update with legacy UAP-IW and data-driven U6+ compatibility paths"
 
 COMPATIBLE_BOARD_NAMES = {"UAP-InWall"}
 COMPATIBLE_BOARD_SHORTNAMES = {"U2IW"}
@@ -419,6 +432,27 @@ def init_phase2_row(rec: Dict[str, object]) -> Dict[str, object]:
         "board_shortname": (rec.get("board_shortname") or "").strip(),
         "device_model": (rec.get("device_model") or "").strip(),
         "model_family_status": (rec.get("model_family_status") or "").strip(),
+        "compatibility_path": "",
+        "device_profile_id": (rec.get("device_profile_id") or "").strip(),
+        "device_identification_status": (rec.get("device_identification_status") or "").strip(),
+        "identity_evidence": "",
+        "transition_id": "",
+        "transition_status": "",
+        "target_artifact_id": "",
+        "target_firmware_version_short": "",
+        "target_firmware_version_full": "",
+        "firmware_filename_expected": "",
+        "firmware_filename_actual": "",
+        "firmware_filename_match": False,
+        "firmware_size_expected": "",
+        "firmware_size_actual": "",
+        "firmware_size_match": False,
+        "firmware_sha256_expected": "",
+        "firmware_sha256_actual": "",
+        "firmware_sha256_match": False,
+        "hostkey_valid": False,
+        "modification_eligible": False,
+        "eligibility_reason": "",
         "hostkey_status": (rec.get("hostkey_status") or "HOSTKEY_NOT_CHECKED").strip(),
         "hostkey_auto_accepted": False,
         "hostkey_error_type": "",
@@ -493,6 +527,47 @@ def confirm_board_info(
         return False, {}, err_type or "SSH_ERROR", (err or out or "").strip()
     info = parse_board_info_extended(out)
     return True, info, "", ""
+
+
+def read_live_preflight_info(
+    plink_path: str,
+    ip: str,
+    user: str,
+    password: str,
+    timeout: int,
+    hostkey_fingerprint: str,
+) -> Tuple[bool, Dict[str, str], str, str]:
+    commands = (
+        ("cat /etc/board.info", "board"),
+        ("cat /etc/version", "version"),
+        ("mca-cli-op info", "mca"),
+    )
+    outputs: Dict[str, str] = {}
+    for command, key in commands:
+        out, err, rc, exc = run_plink(
+            plink_path=plink_path,
+            host=ip,
+            user=user,
+            password=password,
+            command=command,
+            timeout=timeout,
+            batch=True,
+            stdin_data="\n",
+            hostkey_fingerprint=hostkey_fingerprint,
+        )
+        if exc or rc != 0:
+            error_type = classify_putty_error(out, err, rc)
+            return False, {}, error_type or "SSH_ERROR", exc or (err or out or f"{command} failed").strip()
+        outputs[key] = out
+    board = parse_board_info_extended(outputs["board"])
+    mca = parse_mca_info_extended(outputs["mca"])
+    return True, {
+        "board_name": (board.get("board_name") or "").strip(),
+        "board_shortname": (board.get("board_shortname") or "").strip(),
+        "device_model": (mca.get("device_model") or "").strip(),
+        "firmware_version_short": (outputs["version"].splitlines()[0].strip() if outputs["version"] else ""),
+        "firmware_version_full": (mca.get("firmware_version_full") or "").strip(),
+    }, "", ""
 
 
 def read_post_info(
@@ -669,6 +744,27 @@ def write_csv_report(path: str, rows: List[Dict[str, object]]) -> None:
         "board_shortname",
         "device_model",
         "model_family_status",
+        "compatibility_path",
+        "device_profile_id",
+        "device_identification_status",
+        "identity_evidence",
+        "transition_id",
+        "transition_status",
+        "target_artifact_id",
+        "target_firmware_version_short",
+        "target_firmware_version_full",
+        "firmware_filename_expected",
+        "firmware_filename_actual",
+        "firmware_filename_match",
+        "firmware_size_expected",
+        "firmware_size_actual",
+        "firmware_size_match",
+        "firmware_sha256_expected",
+        "firmware_sha256_actual",
+        "firmware_sha256_match",
+        "hostkey_valid",
+        "modification_eligible",
+        "eligibility_reason",
         "hostkey_status",
         "hostkey_auto_accepted",
         "hostkey_error_type",
@@ -715,6 +811,7 @@ def process_one_ap(
     ap_total: int,
     progress_enabled: bool,
     progress_interval: int,
+    compatibility_file: Optional[str] = None,
 ) -> Dict[str, object]:
     row = init_phase2_row(rec)
     ip = row["ip"]
@@ -759,36 +856,97 @@ def process_one_ap(
         progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
-    if model_family_status == "MODEL_FAMILY_MISMATCH":
-        row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH"
-        row["error"] = "MODEL_FAMILY_MISMATCH"
-        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
-        return row
+    legacy_candidate = is_candidate_model(rec)
+    resolved_catalog = None
+    if legacy_candidate:
+        row["compatibility_path"] = "LEGACY_UAP_IW_U2IW"
+        if model_family_status == "MODEL_FAMILY_MISMATCH":
+            row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH"
+            row["error"] = "MODEL_FAMILY_MISMATCH"
+            return row
+        if model_family_status == "MODEL_FAMILY_UNKNOWN" or not model_family_status:
+            row["status"] = "SKIPPED_MODEL_FAMILY_UNKNOWN"
+            row["error"] = "MODEL_FAMILY_UNKNOWN"
+            return row
+        if model_family_status != "MODEL_FAMILY_OK":
+            row["status"] = "SKIPPED_MODEL_FAMILY_UNKNOWN"
+            row["error"] = f"MODEL_FAMILY_STATUS_UNEXPECTED={model_family_status}"
+            return row
+        if not os.path.basename(firmware_path).startswith("BZ.qca933x"):
+            row["status"] = "SKIPPED_FIRMWARE_FAMILY_MISMATCH"
+            row["error"] = "FIRMWARE_FILENAME_NOT_BZ_QCA933X"
+            return row
+        action, version_status = decide_version_action(
+            firmware_version_full=row["pre_firmware_version_full"],
+            firmware_version_short=row["pre_firmware_version_short"],
+            target_full=target_full,
+            target_short=target_short,
+        )
+    else:
+        row["compatibility_path"] = "DECLARATIVE_CATALOG"
+        evidence = {
+            "device_model": row["device_model"],
+            "board_name": row["board_name"],
+            "board_shortname": row["board_shortname"],
+        }
+        row["identity_evidence"] = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        try:
+            catalog = load_catalog(compatibility_file)
+            resolved_catalog = resolve_transition(
+                evidence=evidence,
+                source_short=str(row["pre_firmware_version_short"]),
+                source_full=str(row["pre_firmware_version_full"]),
+                target_short=target_short,
+                target_full=target_full,
+                catalog=catalog,
+            )
+            row["device_profile_id"] = str(resolved_catalog.profile["id"])
+            row["device_identification_status"] = "DEVICE_PROFILE_IDENTIFIED"
+            row["target_artifact_id"] = str(resolved_catalog.artifact["id"])
+            row["target_firmware_version_short"] = str(resolved_catalog.artifact["version_short"])
+            row["target_firmware_version_full"] = str(resolved_catalog.artifact["version_full"])
+            if resolved_catalog.transition:
+                row["transition_id"] = str(resolved_catalog.transition["id"])
+                row["transition_status"] = str(resolved_catalog.transition["support_status"])
+            else:
+                row["transition_status"] = "ALREADY_INSTALLED"
+            artifact_check = verify_artifact(firmware_path, resolved_catalog.artifact)
+            row.update(artifact_check)
+        except CompatibilityResolutionError as exc:
+            status_map = {
+                "DEVICE_PROFILE_NOT_FOUND": "SKIPPED_DEVICE_PROFILE_NOT_FOUND",
+                "DEVICE_PROFILE_AMBIGUOUS": "SKIPPED_DEVICE_PROFILE_AMBIGUOUS",
+                "TARGET_ARTIFACT_NOT_FOUND": "SKIPPED_TARGET_VERSION_MISMATCH",
+                "TARGET_ARTIFACT_AMBIGUOUS": "SKIPPED_TRANSITION_AMBIGUOUS",
+                "TRANSITION_NOT_FOUND": "SKIPPED_SOURCE_VERSION_NOT_ALLOWED",
+                "TRANSITION_AMBIGUOUS": "SKIPPED_TRANSITION_AMBIGUOUS",
+            }
+            row["status"] = status_map.get(exc.code, "SKIPPED_TRANSITION_NOT_FOUND")
+            row["error"] = f"{exc.code}: {exc}"
+            row["eligibility_reason"] = row["error"]
+            return row
+        except (CompatibilityError, OSError) as exc:
+            row["status"] = "FAILED_COMPATIBILITY_CATALOG_INVALID"
+            row["error"] = str(exc)
+            row["eligibility_reason"] = row["error"]
+            return row
 
-    if model_family_status == "MODEL_FAMILY_UNKNOWN" or not model_family_status:
-        row["status"] = "SKIPPED_MODEL_FAMILY_UNKNOWN"
-        row["error"] = "MODEL_FAMILY_UNKNOWN"
-        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
-        return row
-
-    if model_family_status != "MODEL_FAMILY_OK":
-        row["status"] = "SKIPPED_MODEL_FAMILY_UNKNOWN"
-        row["error"] = f"MODEL_FAMILY_STATUS_UNEXPECTED={model_family_status}"
-        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
-        return row
-
-    if not is_candidate_model(rec):
-        row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH"
-        row["error"] = "MODEL_FIELDS_NOT_MATCHING_UAP_IW_U2IW"
-        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
-        return row
-
-    action, version_status = decide_version_action(
-        firmware_version_full=row["pre_firmware_version_full"],
-        firmware_version_short=row["pre_firmware_version_short"],
-        target_full=target_full,
-        target_short=target_short,
-    )
+        if not row["firmware_filename_match"]:
+            row["status"] = "SKIPPED_FIRMWARE_FILENAME_MISMATCH"
+            row["error"] = "FIRMWARE_FILENAME_MISMATCH"
+            row["eligibility_reason"] = row["error"]
+            return row
+        if not row["firmware_size_match"]:
+            row["status"] = "SKIPPED_FIRMWARE_SIZE_MISMATCH"
+            row["error"] = "FIRMWARE_SIZE_MISMATCH"
+            row["eligibility_reason"] = row["error"]
+            return row
+        if not row["firmware_sha256_match"]:
+            row["status"] = "SKIPPED_FIRMWARE_SHA256_MISMATCH"
+            row["error"] = "FIRMWARE_SHA256_MISMATCH"
+            row["eligibility_reason"] = row["error"]
+            return row
+        version_status = "SKIPPED_ALREADY_UPDATED" if resolved_catalog.already_installed else "UPDATE_REQUIRED"
 
     if version_status == "SKIPPED_ALREADY_UPDATED":
         row["status"] = "SKIPPED_ALREADY_UPDATED"
@@ -810,7 +968,9 @@ def process_one_ap(
         progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
-    if not execute and not hostkey_fingerprint.startswith("SHA256:"):
+    row["hostkey_valid"] = bool(re.fullmatch(r"SHA256:[A-Za-z0-9+/]+", hostkey_fingerprint))
+
+    if not execute and not row["hostkey_valid"]:
         row["status"] = "SKIPPED_HOSTKEY_FINGERPRINT_MISSING"
         row["error"] = f"HOSTKEY_FINGERPRINT_INVALID={hostkey_fingerprint!r}"
         row["action"] = "NOOP"
@@ -820,11 +980,13 @@ def process_one_ap(
     if not execute:
         row["status"] = "DRY_RUN_UPDATE_REQUIRED"
         row["action"] = "UPDATE"
+        row["modification_eligible"] = False
+        row["eligibility_reason"] = "DRY_RUN_PLAN_VALID_LIVE_RECHECK_REQUIRED"
         return row
 
     row["action"] = "UPDATE"
 
-    if not hostkey_fingerprint.startswith("SHA256:"):
+    if not row["hostkey_valid"]:
         row["status"] = "UPDATE_FAILED_COMMAND"
         row["error"] = f"HOSTKEY_FINGERPRINT_INVALID={hostkey_fingerprint!r}"
         progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
@@ -868,44 +1030,86 @@ def process_one_ap(
         progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
-    progress_print(ap_index, ap_total, mac, ip, ubicazione, "board.info recheck...", progress_enabled and bool(execute))
-    board_ok, board_info, board_err_type, board_err = confirm_board_info(
-        plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
-    )
-    if not board_ok:
-        if board_err_type == "SSH_HOSTKEY_MISMATCH":
+    progress_print(ap_index, ap_total, mac, ip, ubicazione, "live identity/source recheck...", progress_enabled and bool(execute))
+    if resolved_catalog is not None:
+        live_ok, live_info, live_err_type, live_err = read_live_preflight_info(
+            plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
+        )
+    else:
+        live_ok, board_info, live_err_type, live_err = confirm_board_info(
+            plink_path, ip, user=user, password=password, timeout=timeout, hostkey_fingerprint=hostkey_fingerprint
+        )
+        live_info = dict(board_info)
+    if not live_ok:
+        if live_err_type == "SSH_HOSTKEY_MISMATCH":
             row["hostkey_status"] = "HOSTKEY_MISMATCH"
             row["hostkey_error_type"] = "SSH_HOSTKEY_MISMATCH"
             row["status"] = "SKIPPED_HOSTKEY_MISMATCH"
-            row["error"] = board_err or "HOSTKEY_MISMATCH"
+            row["error"] = live_err or "HOSTKEY_MISMATCH"
             progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
-        if board_err_type == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
+        if live_err_type == "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT":
             row["hostkey_status"] = "HOSTKEY_UNKNOWN_NOT_ACCEPTED"
             row["hostkey_error_type"] = "SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT"
             row["status"] = "SKIPPED_HOSTKEY_UNKNOWN_NOT_ACCEPTED"
-            row["error"] = board_err or "HOSTKEY_UNKNOWN"
+            row["error"] = live_err or "HOSTKEY_UNKNOWN"
             progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
             return row
         row["status"] = "UPDATE_FAILED_COMMAND"
-        row["error"] = board_err or board_err_type or "BOARD_INFO_READ_FAILED"
+        row["error"] = live_err or live_err_type or "LIVE_PREFLIGHT_FAILED"
         progress_print(ap_index, ap_total, mac, ip, ubicazione, f"FAILED {row['status']} ({row['error']})", progress_enabled and bool(execute))
         return row
 
-    bn = board_info.get("board_name") or ""
-    bs = board_info.get("board_shortname") or ""
-    mf = evaluate_model_family(bn, bs, row.get("device_model") or "")
-    if mf != "MODEL_FAMILY_OK":
-        row["board_name"] = bn
-        row["board_shortname"] = bs
-        row["model_family_status"] = mf
-        row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH" if mf == "MODEL_FAMILY_MISMATCH" else "SKIPPED_MODEL_FAMILY_UNKNOWN"
-        row["error"] = f"MODEL_RECHECK={mf}"
-        progress_print(ap_index, ap_total, mac, ip, ubicazione, f"SKIP {row['status']} ({row['error']})", progress_enabled and bool(execute))
-        return row
+    bn = live_info.get("board_name") or ""
+    bs = live_info.get("board_shortname") or ""
+    if resolved_catalog is None:
+        mf = evaluate_model_family(bn, bs, row.get("device_model") or "")
+        if mf != "MODEL_FAMILY_OK":
+            row["board_name"] = bn
+            row["board_shortname"] = bs
+            row["model_family_status"] = mf
+            row["status"] = "SKIPPED_MODEL_FAMILY_MISMATCH" if mf == "MODEL_FAMILY_MISMATCH" else "SKIPPED_MODEL_FAMILY_UNKNOWN"
+            row["error"] = f"MODEL_RECHECK={mf}"
+            return row
+    else:
+        live_evidence = {
+            "device_model": live_info.get("device_model") or "",
+            "board_name": bn,
+            "board_shortname": bs,
+        }
+        report_evidence = {
+            "device_model": row.get("device_model") or "",
+            "board_name": row.get("board_name") or "",
+            "board_shortname": row.get("board_shortname") or "",
+        }
+        try:
+            live_profile = identify_device_profile(live_evidence, load_catalog(compatibility_file))
+        except (CompatibilityError, CompatibilityResolutionError) as exc:
+            row["status"] = "SKIPPED_LIVE_IDENTITY_MISMATCH"
+            row["error"] = str(exc)
+            row["eligibility_reason"] = row["error"]
+            return row
+        if live_profile["id"] != resolved_catalog.profile["id"] or live_evidence != report_evidence:
+            row["status"] = "SKIPPED_REPORT_LIVE_IDENTITY_MISMATCH"
+            row["error"] = f"REPORT={report_evidence!r} LIVE={live_evidence!r}"
+            row["eligibility_reason"] = row["error"]
+            return row
+        if (
+            (live_info.get("firmware_version_short") or "") != row["pre_firmware_version_short"]
+            or (live_info.get("firmware_version_full") or "") != row["pre_firmware_version_full"]
+        ):
+            row["status"] = "SKIPPED_LIVE_SOURCE_VERSION_MISMATCH"
+            row["error"] = (
+                f"REPORT_SOURCE={row['pre_firmware_version_short']!r}/{row['pre_firmware_version_full']!r} "
+                f"LIVE_SOURCE={live_info.get('firmware_version_short')!r}/{live_info.get('firmware_version_full')!r}"
+            )
+            row["eligibility_reason"] = row["error"]
+            return row
 
     row["board_name"] = bn
     row["board_shortname"] = bs
+    row["modification_eligible"] = True
+    row["eligibility_reason"] = "LIVE_PREFLIGHT_OK"
 
     local_fw = os.path.abspath(firmware_path)
     upload_attempts = 0
@@ -1104,16 +1308,48 @@ def process_one_ap(
     row["post_firmware_version_short"] = post.get("post_firmware_version_short") or ""
     row["post_firmware_version_full"] = post.get("post_firmware_version_full") or ""
 
-    post_bn = post.get("post_board_name") or row.get("board_name") or ""
-    post_bs = post.get("post_board_shortname") or row.get("board_shortname") or ""
-    post_dm = post.get("post_device_model") or row.get("device_model") or ""
+    if resolved_catalog is None:
+        post_bn = post.get("post_board_name") or row.get("board_name") or ""
+        post_bs = post.get("post_board_shortname") or row.get("board_shortname") or ""
+        post_dm = post.get("post_device_model") or row.get("device_model") or ""
+    else:
+        post_bn = post.get("post_board_name") or ""
+        post_bs = post.get("post_board_shortname") or ""
+        post_dm = post.get("post_device_model") or ""
     row["board_name"] = post_bn
     row["board_shortname"] = post_bs
     row["device_model"] = post_dm
-    row["model_family_status"] = evaluate_model_family(post_bn, post_bs, post_dm)
+    if resolved_catalog is None:
+        row["model_family_status"] = evaluate_model_family(post_bn, post_bs, post_dm)
+    else:
+        post_evidence = {
+            "device_model": post_dm,
+            "board_name": post_bn,
+            "board_shortname": post_bs,
+        }
+        try:
+            post_profile = identify_device_profile(post_evidence, load_catalog(compatibility_file))
+        except (CompatibilityError, CompatibilityResolutionError) as exc:
+            row["status"] = "FAILED_POST_IDENTITY_MISMATCH"
+            row["error"] = str(exc)
+            return row
+        if post_profile["id"] != resolved_catalog.profile["id"]:
+            row["status"] = "FAILED_POST_IDENTITY_MISMATCH"
+            row["error"] = f"POST_PROFILE={post_profile['id']!r} EXPECTED={resolved_catalog.profile['id']!r}"
+            return row
 
     post_full = (row["post_firmware_version_full"] or "").strip()
     post_short = (row["post_firmware_version_short"] or "").strip()
+
+    if resolved_catalog is not None and post_full == target_full and post_short == target_short:
+        row["post_check_ok"] = True
+        row["status"] = "UPDATE_COMPLETED"
+        return row
+
+    if resolved_catalog is not None:
+        row["status"] = "FAILED_POST_TARGET_VERSION_MISMATCH"
+        row["error"] = f"POST_VERSION_MISMATCH full={post_full!r} short={post_short!r}"
+        return row
 
     if post_full and post_full == target_full:
         row["post_check_ok"] = True
@@ -1147,6 +1383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--verbose", action="store_true", help="Stampa dettagli aggiuntivi (incl. traceback su errori non gestiti)")
     p.add_argument("--input", required=True, help="Report Fase 1 (.json preferito, oppure .csv)")
     p.add_argument("--firmware", required=True, help="Firmware file path (.bin)")
+    p.add_argument("--compatibility-file", help="Compatibility catalog override (default: repository catalog)")
     p.add_argument("--target-version-full", required=True)
     p.add_argument("--target-version-short", required=True)
     p.add_argument("--user", default="ubnt")
@@ -1176,10 +1413,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not os.path.isfile(firmware_path):
         print(f"Errore: firmware path non è un file: {firmware_path}", file=sys.stderr)
         return 2
-    if not os.path.basename(firmware_path).startswith("BZ.qca933x"):
-        print("Errore: firmware file non compatibile (atteso prefisso BZ.qca933x)", file=sys.stderr)
-        return 2
-
     if args.execute:
         if not resolve_executable(args.plink_path):
             print(f"Errore: plink non disponibile: {args.plink_path}", file=sys.stderr)
@@ -1190,6 +1423,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     records = read_input_report(args.input)
     ensure_required_fields(records)
+    if records and all(is_candidate_model(record) for record in records):
+        if not os.path.basename(firmware_path).startswith("BZ.qca933x"):
+            print("Errore: firmware file non compatibile (atteso prefisso BZ.qca933x)", file=sys.stderr)
+            return 2
 
     mode = "EXECUTE" if args.execute else "DRY-RUN"
     print(f"[PHASE2] Mode: {mode} (workers={max(1, args.workers)})")
@@ -1234,6 +1471,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 total,
                 progress_enabled,
                 progress_interval,
+                args.compatibility_file,
             )
             fut_to_rec[fut] = (rec, idx, total)
 

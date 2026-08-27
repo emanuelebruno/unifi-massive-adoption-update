@@ -26,11 +26,11 @@ Discovery, identification, vendor recognition, firmware availability, or archiva
 
 ## Current Executable Support
 
-Current scripts implement Ubiquiti UniFi workflows. UAP-IW / U2IW are the only currently approved modifying targets.
+Current scripts implement Ubiquiti UniFi workflows. UAP-IW / U2IW remain supported through their existing legacy compatibility path. U6+ is supported only for the exact data-driven Phase 2 transition declared in `compatibility/ubiquiti_unifi_firmware.json`.
 
 Other UniFi devices may be discovered and reported during read-only inventory. They remain ineligible for firmware update, set-inform, provisioning, reboot, upload, or configuration changes until a separately approved patch defines and tests exact model, platform, firmware, host-key, report, and operation gates.
 
-The observed U6+ with `board.shortname=UAPL6` is discovered and identified but is not yet modification-eligible. The presence of an MT7981 firmware file does not authorize flashing it.
+U6+ is not generally modification-eligible and remains ineligible for Phase 3/set-inform. Only an exact approved device profile, source version, target artifact, host key, live preflight, and post-check may authorize its declared firmware transition. The presence of an MT7981 firmware file alone never authorizes flashing it.
 
 Adding an adapter, recognizing a model, or adding metadata must not silently broaden eligibility.
 
@@ -85,6 +85,20 @@ Current required gates:
 - Unknown, mismatched, or unsupported devices are skipped.
 
 Future vendor/model support must use exact compatibility evidence and preserve default-deny behavior.
+
+### Data-Driven Firmware Compatibility
+
+U6+ is the first data-driven compatibility profile. UAP-IW / U2IW temporarily remain on the legacy compatibility path as deliberate regression-risk containment; a later approved patch may migrate them to the catalog.
+
+Compatibility data must keep these entities separate:
+
+```text
+DEVICE PROFILE != FIRMWARE ARTIFACT != TRANSITION RULE
+```
+
+A commercial model alone is insufficient compatibility proof. Exact board, hardware, platform, and hardware-revision evidence must be used where reliably available because one commercial model may require different firmware on different revisions. Missing, conflicting, or ambiguous required identity evidence is default-deny.
+
+Adding another approved firmware/version for already-understood hardware should normally require compatibility-catalog changes, not operational Python changes. Operational code should normally change only for new identification behavior, protocols, upgrade mechanisms, validation requirements, or other capabilities.
 
 ### Phase 3: Set-Inform
 
