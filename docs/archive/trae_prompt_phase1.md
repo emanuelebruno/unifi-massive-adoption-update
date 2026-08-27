@@ -1,3 +1,7 @@
+# Historical TRAE prompt — Phase 1
+
+> Historical and non-normative. This prompt records the original Phase 1 implementation context and is superseded by the authoritative `AGENTS.md` contract. Its original requirements below have not been rewritten as current policy.
+
 # Prompt TRAE.AI — Fase 1
 
 Nel progetto è già presente il file:

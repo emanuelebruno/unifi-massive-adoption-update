@@ -1,233 +1,159 @@
-# UAP-IW Tools
+# AP Lifecycle Toolkit
 
-Strumenti Python per inventario, preparazione e configurazione controllata di access point **Ubiquiti UniFi UAP-IW / U2IW**.
+Toolkit Windows-first per discovery, inventario e operazioni controllate sul ciclo di vita degli access point.
 
-Il progetto è pensato per essere eseguito principalmente su **Windows** da **PowerShell**.
+La direzione di lungo periodo è vendor-neutral, ma l'implementazione corrente supporta esclusivamente workflow Ubiquiti UniFi. Non è uno strumento generico per airMAX, UISP, EdgeMAX, Protect o altre famiglie Ubiquiti.
 
-## Fasi previste
+## Stato di sicurezza
+
+Il progetto distingue sempre:
+
+```text
+DISCOVERED
+-> IDENTIFIED
+-> SUPPORTED
+-> MODIFICATION_ELIGIBLE
+```
+
+Un dispositivo rilevato o identificato non è automaticamente supportato o autorizzato a ricevere modifiche. Firmware presente, scaricato o archiviato non significa firmware compatibile, consigliato o ammesso per una transizione.
+
+Supporto operativo corrente:
+
+- discovery/inventario: workflow UniFi in sola lettura;
+- modifica firmware: soltanto UAP-IW / U2IW con tutti i gate esistenti;
+- set-inform: soltanto UAP-IW / U2IW con tutti i gate esistenti;
+- U6+ / `UAPL6`: rilevato e identificato, ma non ancora modification-eligible.
+
+Il firmware MT7981 presente nel repository non autorizza l'aggiornamento di U6+. Il supporto funzionale richiede una patch separata con compatibilità esatta e test di sicurezza.
+
+## Funzionalità implementate
 
 ### Fase 1 — Discovery e inventario
 
-Solo lettura.
+`uap_iw_phase1_discovery.py` esegue operazioni di sola lettura:
 
-Obiettivi:
+- legge CSV con MAC e ubicazione;
+- individua IP tramite scansione subnet e ARP/Neighbor;
+- verifica ping e accesso SSH;
+- legge firmware, board e modello;
+- usa Paramiko e/o PuTTY `plink.exe`;
+- produce report CSV e JSON.
 
-- leggere un CSV con MAC address e ubicazione;
-- trovare l'indirizzo IP degli AP tramite subnet scan e tabella ARP;
-- verificare ping;
-- verificare accesso SSH con credenziali default `ubnt/ubnt`;
-- leggere firmware e informazioni modello;
-- generare report CSV/JSON.
-
-La fase 1 **non deve modificare nulla sugli access point**.
+La Fase 1 non carica firmware, non riavvia, non esegue set-inform e non modifica gli AP. Dispositivi sconosciuti o non supportati possono essere riportati senza diventare idonei alla modifica.
 
 ### Fase 2 — Aggiornamento firmware
 
-Da implementare successivamente.
+`uap_iw_phase2_firmware_update.py` è implementato, gated e dry-run per default.
 
-Dovrà caricare e installare il firmware solo sugli UAP-IW / U2IW compatibili.
-
-Firmware previsto:
-
-```text
-BZ.qca933x.v4.3.28.11361.210128.2309.bin
-```
-
-Il firmware è incluso nel repository.
+Senza `--execute` valida report, modello, versione, firmware e fingerprint senza caricare firmware o avviare upgrade. In execute mode mantiene gli attuali gate UAP-IW/U2IW, usa `plink`/`pscp` con fingerprint esplicita e verifica il dispositivo dopo il riavvio.
 
 ### Fase 3 — Set-inform
 
-Da implementare successivamente.
+`uap_iw_phase3_set_inform.py` è implementato, gated e dry-run per default.
 
-Dovrà lanciare:
+Richiede sempre `--inform-url`. Senza `--execute` non esegue `plink`. In execute mode opera soltanto su record UAP-IW/U2IW idonei e non carica firmware, non avvia upgrade, non riavvia e non esegue reset.
 
-```sh
-set-inform http://unifi.emanuelebruno.it:8080/inform
-```
+## Script e struttura corrente
 
-solo quando richiesto esplicitamente.
-
-## Struttura del progetto
+I nomi `uap_iw_*` descrivono gli entry point operativi correnti. La loro rinomina è intenzionalmente rinviata finché non sarà definita una frontend/API vendor-neutral stabile, evitando una seconda migrazione globale.
 
 ```text
-uap-iw-tools/
-├── .trae/
-│   └── rules/
-│       └── project_rules.md
-├── docs/
-│   └── trae_prompt_phase1.md
-├── firmware/
-│   └── .gitkeep
-├── reports/
-│   └── .gitkeep
+unifi-massive-adoption-update/
+├── .trae/rules/                 # regole TRAE storiche, non normative
+├── docs/archive/                # documenti storici
+├── downloads/                   # download/cache correnti
+├── firmware/                    # firmware locali correnti
+├── reports/                     # output locali ignorati da Git
+├── tools/                       # runtime generato/estratto, ignorato
+├── AGENTS.md                    # contratto operativo autorevole
+├── NEXT_PATCH_UNIFI_AUTOMATIC_DISCOVERY.md
 ├── aps.example.csv
-├── .gitignore
 ├── requirements.txt
 ├── setup_windows.ps1
 ├── uap_iw_phase1_discovery.py
 ├── uap_iw_phase2_firmware_update.py
-└── README.md
+└── uap_iw_phase3_set_inform.py
 ```
 
 ## Setup Windows / PowerShell
+
+Setup manuale con Python già disponibile:
 
 ```powershell
 python -m venv .venv
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-setup_windows.ps1
+pip install -r .\requirements.txt
 ```
 
-### Setup Windows rapido da repository pubblico
+Setup automatizzato corrente:
 
-Su un PC remoto Windows (PowerShell), puoi preparare l’ambiente anche senza clonare il repository: lo script scarica i file necessari dal repository pubblico e prepara `.venv` senza richiedere `Activate.ps1`.
+```powershell
+.\setup_windows.ps1
+```
 
-Caratteristiche:
-- `winget` è opzionale: se presente viene usato come primo tentativo.
-- Se `winget` manca o fallisce:
-  - Python viene installato scaricando l’installer ufficiale da `python.org` in `.\downloads\python-installer.exe` (installazione silenziosa per utente corrente, senza admin).
-  - Se l’installer Python fallisce, viene usato un fallback **portable** con Python **embeddable** estratto in `.\tools\python-embed\` (nessuna installazione di sistema necessaria).
-  - PuTTY viene installato scaricando l’MSI ufficiale in `.\downloads\putty-installer.msi` (se l’MSI fallisce, fallback su `plink.exe`/`pscp.exe` standalone in `.\tools\putty\`).
-- Non richiede Git.
-- `aps.csv` non deve stare nel repository: trasferiscilo separatamente sul PC remoto.
-
-Esempio in una cartella vuota:
+Oppure, senza Git:
 
 ```powershell
 Invoke-WebRequest -Uri https://raw.githubusercontent.com/emanuelebruno/unifi-massive-adoption-update/main/setup_windows.ps1 -OutFile .\setup_windows.ps1
 powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1
 ```
 
-Esempio in una cartella già clonata:
+Lo setup corrente può usare `winget`, installer/download di rete, Python embeddable e PuTTY. Non esegue automaticamente discovery, upgrade o set-inform: stampa soltanto comandi pronti.
 
-```powershell
-.\setup_windows.ps1
-```
-
-## Versioning
-
-Verificare sempre la versione prima di eseguire discovery/aggiornamenti, soprattutto quando si lavora da PC diversi o da PC remoto.
-
-### Verifica versione Phase 1
-
-```powershell
-.\tools\python-embed\python.exe .\uap_iw_phase1_discovery.py --version
-```
-
-### Verifica versione Phase 2
-
-```powershell
-.\tools\python-embed\python.exe .\uap_iw_phase2_firmware_update.py --version
-```
-
-### Verifica versione setup_windows.ps1
+Verifica versioni:
 
 ```powershell
 .\setup_windows.ps1 -Version
+.\tools\python-embed\python.exe .\uap_iw_phase1_discovery.py --version
+.\tools\python-embed\python.exe .\uap_iw_phase2_firmware_update.py --version
+.\tools\python-embed\python.exe .\uap_iw_phase3_set_inform.py --version
 ```
 
-## Esempio CSV
+## Input e report
 
-Copiare il file di esempio:
+Creare l'input operativo partendo dall'esempio:
 
 ```powershell
 Copy-Item .\aps.example.csv .\aps.csv
 ```
 
-Poi inserire i MAC reali e le ubicazioni.
+`aps.csv`, report reali, credenziali, log di produzione e dati specifici dei dispositivi non devono essere committati.
 
-Il file `aps.csv` è ignorato da Git per evitare di pubblicare dati reali.
+## Esecuzione Fase 1
 
-## Esecuzione fase 1
-
-Lo script di Fase 1 è: `uap_iw_phase1_discovery.py`.
-
-### Test singolo IP
+Test su singolo IP:
 
 ```powershell
-python .\uap_iw_phase1_discovery.py --input .\aps.csv --single-ip 192.168.1.50 --user ubnt --password ubnt --out .\reports\report.csv --json .\reports\report.json
+python .\uap_iw_phase1_discovery.py `
+  --input .\aps.csv `
+  --single-ip 192.168.1.50 `
+  --user ubnt --password ubnt `
+  --out .\reports\report.csv `
+  --json .\reports\report.json
 ```
 
-### Scansione subnet
+Scansione subnet:
 
 ```powershell
-python .\uap_iw_phase1_discovery.py --input .\aps.csv --subnet 192.168.1.0/24 --user ubnt --password ubnt --out .\reports\report.csv --json .\reports\report.json
+python .\uap_iw_phase1_discovery.py `
+  --input .\aps.csv `
+  --subnet 192.168.1.0/24 `
+  --user ubnt --password ubnt `
+  --ssh-backend auto `
+  --out .\reports\report.csv `
+  --json .\reports\report.json
 ```
 
-### Parametri
+Backend disponibili: `auto`, `paramiko`, `plink`. Il backend automatico prova Paramiko e può usare `plink.exe` per dispositivi SSH legacy.
 
-```text
---input aps.csv
---subnet 192.168.1.0/24
---single-ip 192.168.1.50
---arp-only
---verbose-arp
---require-ping
---ping-timeout-ms 1000
---user ubnt
---password ubnt
---ssh-backend auto|paramiko|plink
---plink-path plink.exe
---accept-new-hostkeys
---verbose
---out .\reports\report.csv
---json .\reports\report.json
---timeout 5
---workers 64
-```
+Per default nuove host key PuTTY non sono accettate automaticamente. `--accept-new-hostkeys` consente soltanto la gestione esplicita di chiavi nuove in una rete controllata usando `-hostkey SHA256:...`. Host key cambiate o non corrispondenti non devono mai essere auto-accettate.
 
-### SSH backend (Paramiko / plink.exe)
+Il comportamento automatico multi-generazione ancora da implementare è specificato in `NEXT_PATCH_UNIFI_AUTOMATIC_DISCOVERY.md`.
 
-Di default lo script usa `--ssh-backend auto`:
+## Esecuzione Fase 2
 
-- prova prima Paramiko;
-- se Paramiko fallisce su AP con SSH legacy (es. `Incompatible ssh peer` / `no acceptable host key`), fa fallback automatico a `plink.exe`.
-
-Se vuoi forzare:
-
-```powershell
-python .\uap_iw_phase1_discovery.py --input .\aps.csv --single-ip 192.168.0.4 --ssh-backend plink --plink-path plink.exe --out .\reports\report.csv --json .\reports\report.json
-```
-
-#### Host key PuTTY
-
-Per impostazione predefinita (senza `--accept-new-hostkeys`) lo script non accetta automaticamente host key sconosciute tramite plink. Se la host key non è già salvata nella cache di PuTTY, nel report comparirà l'errore:
-
-```text
-SSH_HOSTKEY_UNKNOWN_NEEDS_ACCEPT
-```
-
-In quel caso puoi:
-
-- fare una prima connessione manuale per salvare la host key:
-
-```powershell
-plink.exe -ssh -P 22 -l ubnt -pw ubnt 192.168.0.4 "cat /etc/version"
-```
-
-oppure:
-
-- abilitare l'accettazione automatica delle sole host key nuove/sconosciute con `--accept-new-hostkeys` (solo in rete controllata).
-
-Quando `--accept-new-hostkeys` è attivo, lo script evita prompt interattivi e non scrive nella cache host key di PuTTY: se il primo `plink -batch` fallisce con host key sconosciuta, estrae la fingerprint dall’output e rilancia il comando con `plink -batch -hostkey SHA256:...`. Questo funziona anche con Python embeddable e con `plink.exe` standalone, senza dipendere da Registry/caching.
-
-## Esecuzione fase 2 (aggiornamento firmware)
-
-Lo script di Fase 2 è: `uap_iw_phase2_firmware_update.py`.
-
-Input:
-- report prodotto dalla Fase 1 (preferibilmente JSON)
-- firmware locale nella cartella `.\firmware\`
-
-Nota host key PuTTY:
-- La Fase 1 produce `hostkey_fingerprint` (es. `SHA256:...`).
-- La Fase 2 usa sempre `-hostkey <fingerprint>` con `plink.exe` e `pscp.exe` quando la fingerprint è disponibile.
-- Non viene usato alcun enrollment interattivo e non viene scritta la cache host key di PuTTY (Registry).
-
-### Dry-run (default)
-
-Senza `--execute` lo script non esegue comandi `plink`/`pscp`: valida report (modello/versione/fingerprint) e produce lo status `DRY_RUN_UPDATE_REQUIRED` oppure gli skip pertinenti (es. `SKIPPED_HOSTKEY_FINGERPRINT_MISSING`).
+Dry-run UAP-IW/U2IW:
 
 ```powershell
 python .\uap_iw_phase2_firmware_update.py `
@@ -241,72 +167,11 @@ python .\uap_iw_phase2_firmware_update.py `
   --json .\reports\phase2_update_report.json
 ```
 
-### Execute (attenzione)
+`--execute` abilita operazioni modificanti soltanto dopo tutti i gate. Per attività sul campo è consigliato `--workers 1`. Non usare il comando UAP-IW/U2IW per U6+ o altri modelli.
 
-Con `--execute` lo script può caricare il firmware e avviare l'upgrade, ma solo sugli AP identificati come UAP-IW / U2IW nel report della Fase 1 (`MODEL_FAMILY_OK`).
+## Esecuzione Fase 3
 
-```powershell
-python .\uap_iw_phase2_firmware_update.py `
-  --input .\reports\report_subnet.json `
-  --firmware .\firmware\BZ.qca933x.v4.3.28.11361.210128.2309.bin `
-  --target-version-full 4.3.28.11361 `
-  --target-version-short BZ.v4.3.28 `
-  --user ubnt --password ubnt `
-  --plink-path plink.exe --pscp-path pscp.exe `
-  --out .\reports\phase2_update_report.csv `
-  --json .\reports\phase2_update_report.json `
-  --workers 1 `
-  --execute
-```
-
-Opzioni upload (execute):
-- `--upload-timeout 120` (timeout pscp dedicato, utile su UAP-IW vecchi/slow link)
-- `--upload-retries 1` (numero tentativi upload; >1 abilita retry su timeout/errori transitori)
-
-Opzioni progress (execute):
-- progress live è attivo di default in `--execute`
-- `--no-progress` disabilita l'output live
-- `--progress` forza l'abilitazione (utile se vuoi standardizzare wrapper/scheduler)
-- `--progress-interval 5` controlla l'intervallo (secondi) dei messaggi durante reboot/back-online
-
-### Host key PuTTY e --accept-new-hostkeys
-
-Per impostazione predefinita gli script non accettano automaticamente nuove host key PuTTY.
-
-In scenari massivi (AP appena resettati) puoi abilitare l'accettazione automatica delle sole host key nuove/sconosciute con:
-
-```powershell
---accept-new-hostkeys
-```
-
-Note:
-- Usare `--accept-new-hostkeys` solo in rete controllata.
-- Le host key mismatch/changed non vengono mai accettate automaticamente.
-- La cache PuTTY è per-utente Windows. Se lo script gira come SYSTEM (es. TacticalRMM) potrebbe non vedere le host key salvate dall'utente interattivo e potrebbe creare/gestire una cache separata.
-
-## Esecuzione fase 3 (set-inform)
-
-Lo script di Fase 3 è: `uap_iw_phase3_set_inform.py`.
-
-Input consigliato:
-- report Fase 2 in modalità execute (es. `phase2_execute_report_*.csv/.json`), perché include post-check firmware e stati più affidabili.
-
-Parametro obbligatorio:
-- `--inform-url` deve essere passato esplicitamente (non è mai hardcoded) e deve contenere `/inform` (es. `http://IP_CONTROLLER:8080/inform`).
-
-Nota:
-- La Fase 3 non fa firmware upload, non fa firmware upgrade, non fa reboot e non fa reset.
-- Per operazioni sul campo, usare `--workers 1` per esecuzione sequenziale.
-
-Opzioni progress (execute):
-- progress live è attivo di default in `--execute`
-- `--no-progress` disabilita l'output live
-- `--progress` forza l'abilitazione
-- `--progress-interval 5` controlla l'intervallo (secondi) dei messaggi periodici
-
-### Dry-run (default, no-network)
-
-Senza `--execute` lo script non esegue `plink`: valida input/report e produce `DRY_RUN_SET_INFORM_REQUIRED` oppure gli `SKIPPED_*`.
+Dry-run:
 
 ```powershell
 python .\uap_iw_phase3_set_inform.py `
@@ -319,34 +184,76 @@ python .\uap_iw_phase3_set_inform.py `
   --workers 1
 ```
 
-### Execute (attenzione)
+`--execute` abilita set-inform soltanto sui record idonei. L'URL deve essere fornito esplicitamente e contenere `/inform`.
 
-Con `--execute` lo script esegue solo `set-inform` via `plink -batch -hostkey SHA256:...` sugli AP selezionati come sicuri (modello UAP-IW/U2IW verificato, hostkey fingerprint presente, firmware target dove richiesto).
+## Firmware: cache corrente e archivio storico futuro
 
-```powershell
-python .\uap_iw_phase3_set_inform.py `
-  --input .\reports\phase2_execute_report.json `
-  --inform-url http://IP_CONTROLLER:8080/inform `
-  --user ubnt --password ubnt `
-  --plink-path plink.exe `
-  --out .\reports\phase3_set_inform_execute.csv `
-  --json .\reports\phase3_set_inform_execute.json `
-  --workers 1 `
-  --execute
-```
-
-## Note di sicurezza
-
-Non committare:
-
-- firmware `.bin`;
-- report reali;
-- CSV con MAC address reali;
-- credenziali personalizzate;
-- log di produzione.
-
-La regola di progetto si trova in:
+I file attualmente tracciati sono:
 
 ```text
-.trae/rules/project_rules.md
+firmware/BZ.qca933x.v4.3.28.11361.210128.2309.bin
+firmware/BZ.MT7981_6.7.54+15663.260513.1738.bin
 ```
+
+Sono asset intenzionali dello sviluppo corrente. La loro presenza non è una decisione di compatibilità.
+
+Il progetto dovrà distinguere:
+
+```text
+ARCHIVED / AVAILABLE
+!= COMPATIBLE
+!= RECOMMENDED
+!= ALLOWED FOR THIS TRANSITION
+```
+
+La direzione futura prevede:
+
+- repository software principale con codice, adapter, compatibilità e manifest;
+- archivio firmware secondario multi-vendor con binari redistribuibili, metadati, provenienza e SHA256;
+- sorgente ufficiale del vendor preferita quando disponibile;
+- archivio verificato del progetto come fallback/preservazione;
+- cache firmware locale;
+- sola metadatazione/hash quando la redistribuzione non è consentita.
+
+Ogni firmware utilizzabile dovrà essere risolto tramite compatibilità esplicita e verificato con SHA256. Nome file o sorgente non autorizzano mai l'installazione.
+
+## Runtime locale e futuro offline
+
+Semantica architetturale prevista:
+
+```text
+vendor/      asset runtime terzi revisionati e versionati
+downloads/   download temporanei e cache di rete
+tools/       runtime generato, installato o estratto
+firmware/    area firmware locale di lavoro/cache
+```
+
+Ordine desiderato:
+
+```text
+asset runtime locale versionato
+-> tool generato/estratto
+-> rete come fallback opzionale
+```
+
+Python/bootstrap, wheel Python e PuTTY o strumenti equivalenti dovranno poter essere disponibili localmente. `requirements.txt` da solo non consente installazione realmente offline. Il packaging offline e la migrazione degli asset non sono ancora implementati.
+
+## Architettura futura
+
+```text
+CLI ────────┐
+            ├── servizi applicativi/core riutilizzabili ── adapter vendor
+WEB locale ─┘                                      ├── Ubiquiti/UniFi
+                                                  ├── TP-Link/Omada
+                                                  ├── Aruba
+                                                  ├── Cisco
+                                                  └── Ruckus
+```
+
+Il core futuro gestirà modelli normalizzati, policy di sicurezza, compatibilità, firmware, orchestrazione e report. Gli adapter conterranno protocolli, identificatori e comandi specifici del vendor. La UI web locale e la CLI useranno gli stessi servizi strutturati.
+
+Questa separazione, il firmware manager, gli adapter, la UI e il packaging offline sono direzioni architetturali: non sono implementati nella versione corrente.
+
+## Regole autorevoli
+
+Il contratto operativo primario è `AGENTS.md`. I documenti sotto `.trae/rules/` e `docs/archive/` sono storici e non normativi.

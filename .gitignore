@@ -12,10 +12,13 @@ reports/*
 tools/
 !reports/.gitkeep
 
-# Firmware files should not be committed
+# Firmware is a local working/cache area. Preserve the two intentionally
+# tracked development assets, but do not commit arbitrary cache binaries.
+firmware/*.bin
 !firmware/
 !firmware/.gitkeep
 !firmware/BZ.qca933x.v4.3.28.11361.210128.2309.bin
+!firmware/BZ.MT7981_6.7.54+15663.260513.1738.bin
 
 # Logs
 *.log

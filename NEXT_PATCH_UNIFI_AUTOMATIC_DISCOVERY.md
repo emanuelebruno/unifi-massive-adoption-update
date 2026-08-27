@@ -1,5 +1,11 @@
 # NEXT PATCH — Make UniFi discovery truly automatic
 
+## Architectural context
+
+This remains an approved future specification for the current Ubiquiti UniFi discovery workflow. In the long-term vendor-neutral architecture, the interrogation commands, identifiers, and classification rules described here belong in the Ubiquiti/UniFi adapter rather than the generic discovery core.
+
+Generic discovery must not make a device modification-eligible. A device may become `DISCOVERED` and `IDENTIFIED` while remaining unsupported for every modifying operation.
+
 ## Priority
 
 **MANDATORY / NEXT PATCH**
@@ -217,19 +223,20 @@ Automatic discovery must still find the AP by actively probing the LAN before re
 
 Verify that Phase 1 executes no commands capable of modifying AP state.
 
-## Additional cleanup worth including
+## Firmware policy context
 
-The current `.gitignore` comment says firmware files should not be committed, but a new firmware such as:
+The firmware cleanup previously proposed here has been superseded. The two firmware binaries currently tracked under `firmware/` are intentional development assets and must remain unchanged. New arbitrary `.bin` files in that local working/cache area should not be committed implicitly.
+
+Long-term preservation belongs in a verified, multi-vendor firmware archive with metadata, provenance, size, and SHA256, while the main software repository retains compatibility and firmware metadata. These states must remain distinct:
 
 ```text
-firmware/BZ.MT7981_6.7.54+15663.260513.1738.bin
+ARCHIVED / AVAILABLE
+!= COMPATIBLE
+!= RECOMMENDED
+!= ALLOWED FOR THIS TRANSITION
 ```
 
-appears as untracked in `git status`.
-
-Consider changing firmware ignore rules so arbitrary local `.bin` firmware files are ignored by default while explicitly versioned exceptions, if any, remain intentional.
-
-This cleanup is secondary to the discovery fixes above and must not distract from the mandatory discovery patch.
+In particular, the presence of `BZ.MT7981_6.7.54+15663.260513.1738.bin` does not authorize a U6+ firmware update. That requires a separately approved functional compatibility/update patch.
 
 ## Final objective
 
