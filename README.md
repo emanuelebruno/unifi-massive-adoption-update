@@ -22,8 +22,8 @@ Supporto operativo corrente:
 - discovery/inventario: workflow UniFi in sola lettura;
 - modifica firmware UAP-IW / U2IW: percorso legacy con tutti i gate esistenti;
 - modifica firmware U6+: soltanto la transizione dichiarativa esatta UAPL6 da `6.5.64.14808` a `6.7.54.15663`;
-- set-inform: soltanto UAP-IW / U2IW con tutti i gate esistenti;
-- U6+ resta sempre escluso dalla Fase 3/set-inform.
+- set-inform UAP-IW / U2IW: percorso legacy con tutti i gate esistenti;
+- set-inform U6+: soltanto il profilo/artifact/versione esplicitamente autorizzato per la Fase 3, partendo da un report Fase 2 qualificante e superando il preflight live con host key fissata.
 
 Il firmware MT7981 presente nel repository non autorizza da solo l'aggiornamento. La modifica richiede il match univoco di profilo, sorgente, transizione e artifact, SHA256 corretto, host key valida e preflight live coerente.
 
@@ -52,7 +52,9 @@ Senza `--execute` valida report, modello, versione, firmware e fingerprint senza
 
 `uap_iw_phase3_set_inform.py` è implementato, gated e dry-run per default.
 
-Richiede sempre `--inform-url`. Senza `--execute` non esegue `plink`. In execute mode opera soltanto su record UAP-IW/U2IW idonei e non carica firmware, non avvia upgrade, non riavvia e non esegue reset.
+Richiede sempre `--inform-url`. Senza `--execute` non esegue `plink` e un piano valido resta `modification_eligible=false` finché manca il preflight live. In execute mode opera sul percorso legacy UAP-IW/U2IW oppure sull'esatto percorso dichiarativo U6+ autorizzato per questa operazione; non carica firmware, non avvia upgrade, non riavvia e non esegue reset.
+
+La presenza di un profilo, artifact o transizione nel catalogo firmware non concede automaticamente l'autorizzazione alla Fase 3. Set-inform richiede una policy operativa separata ed esplicita.
 
 ## Script e struttura corrente
 
@@ -102,7 +104,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/emanuelebruno/unifi-mas
 powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1
 ```
 
-Lo setup corrente può usare `winget`, installer/download di rete, Python embeddable e PuTTY. Non esegue automaticamente discovery, upgrade o set-inform: stampa soltanto comandi pronti.
+Lo setup corrente può usare `winget`, installer/download di rete, Python embeddable e PuTTY. Provisiona e compila gli entry point delle Fasi 1, 2 e 3. Non esegue automaticamente discovery, upgrade o set-inform: stampa soltanto comandi pronti.
 
 Verifica versioni:
 
@@ -213,7 +215,9 @@ UAP-IW/U2IW restano temporaneamente sul percorso compatibilità legacy per conte
 
 ## Esecuzione Fase 3
 
-Dry-run:
+UAP-IW/U2IW conservano il percorso `LEGACY_UAP_IW_U2IW`, incluse le regole firmware e `--allow-non-target-firmware` esistenti. U6+ usa un percorso separato `DECLARATIVE_CATALOG`, senza fallback tra i due.
+
+Dry-run legacy UAP-IW/U2IW:
 
 ```powershell
 python .\uap_iw_phase3_set_inform.py `
@@ -226,7 +230,26 @@ python .\uap_iw_phase3_set_inform.py `
   --workers 1
 ```
 
-`--execute` abilita set-inform soltanto sui record idonei. L'URL deve essere fornito esplicitamente e contenere `/inform`.
+Dry-run U6+ dichiarativo:
+
+```powershell
+python .\uap_iw_phase3_set_inform.py `
+  --input .\reports\u6plus_phase2_execute.json `
+  --inform-url http://IP_CONTROLLER:8080/inform `
+  --target-version-short BZ.6.7.54 `
+  --target-version-full 6.7.54.15663 `
+  --user ubnt --password ubnt `
+  --plink-path plink.exe `
+  --out .\reports\u6plus_phase3_dryrun.csv `
+  --json .\reports\u6plus_phase3_dryrun.json `
+  --workers 1
+```
+
+L'unica policy dichiarativa Fase 3 corrente autorizza il profilo `ubiquiti-unifi-u6plus-uapl6` con artifact `ubiquiti-unifi-u6plus-6.7.54.15663`, short `BZ.6.7.54` e full `6.7.54.15663`. Sono accettati soltanto report Fase 2 `UPDATE_COMPLETED` con prova completa del preflight/update/post-check oppure `SKIPPED_ALREADY_UPDATED` con identità, artifact, firmware corrente e verifiche artifact esatte. Un report Fase 1 U6+ non è accettato.
+
+Il dry-run è offline, produce `DRY_RUN_SET_INFORM_REQUIRED`, ma mantiene `modification_eligible=false` e `eligibility_reason=DRY_RUN_PLAN_VALID_LIVE_RECHECK_REQUIRED`. In execute, prima di set-inform, Plink usa la fingerprint fissata e verifica live `/etc/version`, `/etc/board.info` e `mca-cli-op info`. Solo l'identità esatta U6+/U6+/UAPL6 e le versioni short/full esatte consentono `modification_eligible=true` con `LIVE_PREFLIGHT_OK`.
+
+`--allow-non-target-firmware` non può aggirare alcun gate dichiarativo U6+. `--execute` abilita set-inform soltanto dopo tutti i gate; l'URL deve essere fornito esplicitamente e contenere `/inform`.
 
 ## Firmware: cache corrente e archivio storico futuro
 

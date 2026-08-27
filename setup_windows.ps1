@@ -4,7 +4,7 @@ param(
 )
 
 $ScriptName = "setup_windows.ps1"
-$ScriptVersion = "0.5.1"
+$ScriptVersion = "0.6.0"
 $ScriptBuildDate = "2026-08-27"
 $ScriptSummary = "Windows bootstrap with compatibility catalog provisioning, Python fallback and local PuTTY tools"
 
@@ -599,6 +599,7 @@ Ensure-Directory -Path '.\compatibility'
 $requiredFiles = @(
     'uap_iw_phase1_discovery.py',
     'uap_iw_phase2_firmware_update.py',
+    'uap_iw_phase3_set_inform.py',
     'unifi_firmware_compatibility.py',
     'compatibility/ubiquiti_unifi_firmware.json',
     'requirements.txt'
@@ -674,6 +675,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Section 'py_compile'
 & $pythonForInstall -m py_compile .\uap_iw_phase1_discovery.py | Out-Host
 & $pythonForInstall -m py_compile .\uap_iw_phase2_firmware_update.py | Out-Host
+& $pythonForInstall -m py_compile .\uap_iw_phase3_set_inform.py | Out-Host
 & $pythonForInstall -m py_compile .\unifi_firmware_compatibility.py | Out-Host
 & $pythonForInstall -c "import os, sys; sys.path.insert(0, os.getcwd()); import unifi_firmware_compatibility as c; print('OK: compatibility catalog ' + c.validate_default_catalog())" | Out-Host
 if ($LASTEXITCODE -ne 0) {
@@ -717,6 +719,17 @@ $pythonForPrint .\uap_iw_phase2_firmware_update.py `
   --plink-path $plinkForPrint --pscp-path $pscpForPrint `
   --out .\reports\phase2_update_report.csv `
   --json .\reports\phase2_update_report.json
+
+Fase 3 dry-run (U6+ dichiarativo, da report Fase 2 qualificante):
+$pythonForPrint .\uap_iw_phase3_set_inform.py `
+  --input .\reports\phase2_update_report.json `
+  --inform-url http://CONTROLLER_IP:8080/inform `
+  --target-version-short BZ.6.7.54 `
+  --target-version-full 6.7.54.15663 `
+  --user ubnt --password ubnt `
+  --plink-path $plinkForPrint `
+  --out .\reports\phase3_set_inform_dryrun.csv `
+  --json .\reports\phase3_set_inform_dryrun.json
 "@ | Write-Host
 
 Write-Host ''

@@ -26,11 +26,11 @@ Discovery, identification, vendor recognition, firmware availability, or archiva
 
 ## Current Executable Support
 
-Current scripts implement Ubiquiti UniFi workflows. UAP-IW / U2IW remain supported through their existing legacy compatibility path. U6+ is supported only for the exact data-driven Phase 2 transition declared in `compatibility/ubiquiti_unifi_firmware.json`.
+Current scripts implement Ubiquiti UniFi workflows. UAP-IW / U2IW remain supported through their existing legacy compatibility path. U6+ is supported for the exact data-driven Phase 2 transition declared in `compatibility/ubiquiti_unifi_firmware.json` and for the separately authorized, exact post-Phase-2 Phase 3 policy described below.
 
 Other UniFi devices may be discovered and reported during read-only inventory. They remain ineligible for firmware update, set-inform, provisioning, reboot, upload, or configuration changes until a separately approved patch defines and tests exact model, platform, firmware, host-key, report, and operation gates.
 
-U6+ is not generally modification-eligible and remains ineligible for Phase 3/set-inform. Only an exact approved device profile, source version, target artifact, host key, live preflight, and post-check may authorize its declared firmware transition. The presence of an MT7981 firmware file alone never authorizes flashing it.
+U6+ is not generally modification-eligible. Only exact operation-specific policy may authorize its firmware transition or set-inform workflow. The presence of an MT7981 firmware file, a compatibility profile, an artifact, or an approved firmware transition alone never authorizes another operation.
 
 Adding an adapter, recognizing a model, or adding metadata must not silently broaden eligibility.
 
@@ -100,13 +100,22 @@ A commercial model alone is insufficient compatibility proof. Exact board, hardw
 
 Adding another approved firmware/version for already-understood hardware should normally require compatibility-catalog changes, not operational Python changes. Operational code should normally change only for new identification behavior, protocols, upgrade mechanisms, validation requirements, or other capabilities.
 
+Firmware compatibility authorization is operation-specific. Catalog presence or firmware-transition approval must never silently grant set-inform, adoption, reboot, configuration, or any other modifying permission. Every modifying workflow requires its own explicit allow policy and live gates.
+
 ### Phase 3: Set-Inform
 
 Phase 3 is implemented, gated, and dry-run by default. Set-inform is a UniFi-specific adapter concern in the future architecture.
 
-Dry-run may read Phase 1/2 reports, validate candidates and the explicitly supplied inform URL, produce a plan, and skip unsafe records.
+Dry-run may read Phase 1/2 reports for legacy devices and qualifying Phase 2 reports for declarative devices, validate candidates and the explicitly supplied inform URL, produce a plan, and skip unsafe records. A valid dry-run plan is not modification-eligible and must not perform network operations.
 
-Execute mode is allowed only when explicitly requested and the command uses `--execute`. It may run set-inform and post-checks only on eligible UAP-IW / U2IW devices.
+Execute mode is allowed only when explicitly requested and the command uses `--execute`. It may run set-inform and post-checks through two explicit, non-fallback paths:
+
+- `LEGACY_UAP_IW_U2IW`: existing UAP-IW / U2IW behavior and gates.
+- `DECLARATIVE_CATALOG`: only profile `ubiquiti-unifi-u6plus-uapl6`, artifact `ubiquiti-unifi-u6plus-6.7.54.15663`, short version `BZ.6.7.54`, and full version `6.7.54.15663`, under the separate Phase 3 operation policy.
+
+Declarative U6+ Phase 3 requires a qualifying Phase 2 `UPDATE_COMPLETED` or exact-evidence `SKIPPED_ALREADY_UPDATED` report. Phase 1 U6+ reports are not eligible. Before set-inform, pinned-hostkey live reads of `/etc/version`, `/etc/board.info`, and `mca-cli-op info` must uniquely reproduce the expected profile, report identity, and exact short/full target firmware. Only then may the row become modification-eligible with `LIVE_PREFLIGHT_OK`.
+
+`--allow-non-target-firmware` retains only its legacy meaning and must never bypass declarative identity, report, profile, artifact, target-version, host-key, or live gates.
 
 The inform URL must never be implicit or hardcoded. Unknown, mismatched, unsupported, or host-key-unsafe devices must be skipped.
 
